@@ -4,11 +4,13 @@ import numpy as np
 from datetime import datetime, timedelta
 
 # =========================
-# 0. 策略参数
+# 0. 参数
 # =========================
-MAX_HOLDINGS = 20         # 最大持仓数
-REBALANCE_FREQ = "W-FRI"  # 调仓频率：D=每日，W-FRI=每周五
-MIN_SCORE = 0             # 最低信号强度，<=0 表示不额外过滤
+MAX_HOLDINGS = 20
+INITIAL_WEIGHT = 0.05
+LOW_PROFIT_THRESHOLD = 0.1
+STOP_DRAWDOWN_LOW = 0.1
+STOP_DRAWDOWN_HIGH = 0.1
 
 # =========================
 # 1. 启动 Wind
@@ -16,7 +18,7 @@ MIN_SCORE = 0             # 最低信号强度，<=0 表示不额外过滤
 w.start()
 
 # =========================
-# 2. 全A成分股
+# 2. 中证800成分股
 # =========================
 sector_id = "1000011893000000"
 
@@ -29,13 +31,13 @@ stock_codes = sector.Data[code_idx]
 stock_names = sector.Data[name_idx]
 code_to_name = dict(zip(stock_codes, stock_names))
 
-print("全A股票数量：", len(stock_codes))
+print("中证800股票数量：", len(stock_codes))
 
 # =========================
 # 3. 时间区间
 # =========================
 end_date = datetime.today().strftime("%Y-%m-%d")
-start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+start_date = (datetime.today() - timedelta(days=1200)).strftime("%Y-%m-%d")
 
 # =========================
 # 4. 行情获取
@@ -71,26 +73,7 @@ close_df = get_wsd_batch(stock_codes, "close")
 print("行情维度：", close_df.shape)
 
 # =========================
-# 6. 指数（沪深300）
-# =========================
-index_code = "000300.SH"
-idx_data = w.wsd(index_code, "close", start_date, end_date, "PriceAdj=F")
-
-index_df = pd.Series(idx_data.Data[0], index=idx_data.Times)
-
-index_ma60 = index_df.rolling(60).mean()
-
-# =========================
-# 7. 动态仓位
-# =========================
-market_signal = index_df > index_ma60
-market_signal = market_signal.shift(1).fillna(False)
-
-exposure = np.where(market_signal, 1.0, 0.3)
-exposure = pd.Series(exposure, index=index_df.index)
-
-# =========================
-# 8. 均线
+# 6. 均线
 # =========================
 ma5 = close_df.rolling(5).mean()
 ma60 = close_df.rolling(60).mean()
@@ -100,70 +83,80 @@ ma60 = close_df.rolling(60).mean()
 # =========================
 spread = ma5 - ma60
 signal = np.sign(spread)
+daily_ret = close_df.pct_change()
+ma60_up = ma60 > ma60.shift(1)
+limit_gain = daily_ret <= 0.05
+candidate_score = (ma5 / ma60 - 1) + 0.5 * (ma60 / ma60.shift(5) - 1)
+candidate_score = candidate_score.replace([np.inf, -np.inf], np.nan)
 
 cross = signal.diff()
 
-golden_signal = (cross == 2)
-death_signal = (cross == -2)
+golden_signal = (cross == 2) & ma60_up & limit_gain
 
 golden_signal = golden_signal.shift(1).fillna(False).astype(bool)
-death_signal = death_signal.shift(1).fillna(False).astype(bool)
 
 # =========================
 # 10. 持仓状态机
 # =========================
-strength_score = (ma5 / ma60 - 1).replace([np.inf, -np.inf], np.nan).fillna(0)
-
-rebalance_dates = pd.Series(False, index=close_df.index)
-if REBALANCE_FREQ == "D":
-    rebalance_dates[:] = True
-else:
-    rebalance_dates.loc[pd.date_range(close_df.index[0], close_df.index[-1], freq=REBALANCE_FREQ)] = True
-    rebalance_dates = rebalance_dates.reindex(close_df.index, fill_value=False)
-
 position = pd.DataFrame(0.0, index=close_df.index, columns=close_df.columns)
-current_holdings = set()
+stop_signal = pd.DataFrame(False, index=close_df.index, columns=close_df.columns)
+current_holdings = {}
 
 for date in close_df.index:
-    buy_list = set(golden_signal.columns[golden_signal.loc[date]])
-    sell_list = set(death_signal.columns[death_signal.loc[date]])
+    # 先检查老持仓是否触发回撤卖出
+    for code in list(current_holdings.keys()):
+        price = close_df.at[date, code]
+        holding_info = current_holdings[code]
+        entry_price = holding_info["entry_price"]
+        peak_price = holding_info["peak_price"]
 
-    # 死叉日优先卖出，避免无效持仓残留
-    current_holdings -= sell_list
+        if pd.notna(price):
+            peak_price = max(peak_price, price) if pd.notna(peak_price) else price
+            peak_gain = peak_price / entry_price - 1 if entry_price > 0 else 0
+            stop_drawdown = STOP_DRAWDOWN_HIGH if peak_gain >= LOW_PROFIT_THRESHOLD else STOP_DRAWDOWN_LOW
 
-    if rebalance_dates.loc[date]:
-        candidate_holdings = current_holdings | buy_list
-        if candidate_holdings:
-            score_today = strength_score.loc[date, list(candidate_holdings)]
-            score_today = score_today[score_today > MIN_SCORE].sort_values(ascending=False)
-            current_holdings = set(score_today.head(MAX_HOLDINGS).index.tolist())
-        else:
-            current_holdings = set()
+            if peak_price > 0 and price <= peak_price * (1 - stop_drawdown):
+                stop_signal.at[date, code] = True
+                del current_holdings[code]
+                continue
+
+            current_holdings[code] = {
+                "entry_price": entry_price,
+                "peak_price": peak_price
+            }
+
+    # 有空余仓位时，从当日新金叉候选里按分数排序补仓
+    available_slots = MAX_HOLDINGS - len(current_holdings)
+    if available_slots > 0:
+        buy_candidates = golden_signal.columns[golden_signal.loc[date]].tolist()
+        buy_candidates = [code for code in buy_candidates if code not in current_holdings]
+
+        if buy_candidates:
+            score_today = candidate_score.loc[date, buy_candidates].dropna().sort_values(ascending=False)
+            for code in score_today.head(available_slots).index:
+                price = close_df.at[date, code]
+                if pd.notna(price):
+                    current_holdings[code] = {
+                        "entry_price": price,
+                        "peak_price": price
+                    }
 
     for code in current_holdings:
-        position.loc[date, code] = 1.0
+        position.at[date, code] = INITIAL_WEIGHT
 
 # =========================
-# 11. 等权
+# 11. 固定权重
 # =========================
-weight_sum = position.sum(axis=1)
-position = position.div(weight_sum.replace(0, np.nan), axis=0)
 position = position.fillna(0)
 
 # =========================
-# 12. 应用动态仓位
+# 12. 收益
 # =========================
-exposure = exposure.reindex(position.index).ffill().fillna(0)
-position = position.mul(exposure, axis=0)
-
-# =========================
-# 13. 收益
-# =========================
-ret = close_df.pct_change().fillna(0)
+ret = daily_ret.fillna(0)
 strategy_ret = (position.shift(1) * ret).sum(axis=1)
 
 # =========================
-# 14. 成本
+# 13. 成本
 # =========================
 cost_rate = 0.0015
 turnover = position.diff().abs().sum(axis=1)
@@ -171,12 +164,12 @@ turnover = position.diff().abs().sum(axis=1)
 strategy_ret = strategy_ret - turnover * cost_rate
 
 # =========================
-# 15. 净值
+# 14. 净值
 # =========================
 nav = (1 + strategy_ret).cumprod()
 
 # =========================
-# ⭐ 16. 年化收益（修正版）
+# ⭐ 15. 年化收益（修正版）
 # =========================
 # 找到首次建仓日
 first_trade_date = position.sum(axis=1).ne(0).idxmax()
@@ -184,6 +177,8 @@ first_trade_date = position.sum(axis=1).ne(0).idxmax()
 # 截取有效区间
 nav_active = nav.loc[first_trade_date:]
 ret_active = strategy_ret.loc[first_trade_date:]
+position_active = position.loc[first_trade_date:]
+turnover_active = turnover.loc[first_trade_date:]
 
 # 年化收益
 annual_ret = nav_active.iloc[-1] ** (252 / len(nav_active)) - 1
@@ -194,30 +189,30 @@ annual_vol = ret_active.std() * np.sqrt(252)
 # 夏普
 sharpe = annual_ret / annual_vol if annual_vol != 0 else 0
 
-# 最大回撤（仍用全周期）
-rolling_max = nav.cummax()
-drawdown = nav / rolling_max - 1
+# 最大回撤
+rolling_max = nav_active.cummax()
+drawdown = nav_active / rolling_max - 1
 max_dd = drawdown.min()
 
 # 持仓 & 换手
-holding_count = (position > 0).sum(axis=1)
+holding_count = (position_active > 0).sum(axis=1)
 avg_holding = holding_count.mean()
 
-avg_turnover = turnover.mean()
+avg_turnover = turnover_active.mean()
 annual_turnover = avg_turnover * 252
 
-win_rate = (strategy_ret > 0).mean()
+win_rate = (ret_active > 0).mean()
 
 stats = pd.DataFrame({
-    "指标": ["年化收益","年化波动","夏普比率","最大回撤","平均持仓数","最大持仓数","年化换手率","日胜率"],
-    "数值": [annual_ret, annual_vol, sharpe, max_dd, avg_holding, holding_count.max(), annual_turnover, win_rate]
+    "指标": ["年化收益","年化波动","夏普比率","最大回撤","平均持仓数","年化换手率","日胜率"],
+    "数值": [annual_ret, annual_vol, sharpe, max_dd, avg_holding, annual_turnover, win_rate]
 })
 
 print("\n【策略指标】")
 print(stats)
 
 # =========================
-# 17. 持仓（最近20日）
+# 17. 持仓（全历史）
 # =========================
 def extract_position(df, code_map):
     records = []
@@ -233,10 +228,7 @@ def extract_position(df, code_map):
             })
     return pd.DataFrame(records)
 
-last_20_dates = position.index[-20:]
-position_recent = position.loc[last_20_dates]
-
-position_df = extract_position(position_recent, code_to_name)
+position_df = extract_position(position, code_to_name)
 position_df = position_df.sort_values(by="日期", ascending=False)
 
 # =========================
@@ -245,10 +237,10 @@ position_df = position_df.sort_values(by="日期", ascending=False)
 today = position.index[-1]
 
 golden_today = golden_signal.loc[today]
-death_today = death_signal.loc[today]
+stop_today = stop_signal.loc[today]
 
 golden_list = golden_today[golden_today].index.tolist()
-death_list = death_today[death_today].index.tolist()
+stop_list = stop_today[stop_today].index.tolist()
 
 golden_df = pd.DataFrame({
     "代码": golden_list,
@@ -256,23 +248,23 @@ golden_df = pd.DataFrame({
     "信号": "金叉"
 })
 
-death_df = pd.DataFrame({
-    "代码": death_list,
-    "名称": [code_to_name.get(c, c) for c in death_list],
-    "信号": "死叉"
+stop_df = pd.DataFrame({
+    "代码": stop_list,
+    "名称": [code_to_name.get(c, c) for c in stop_list],
+    "信号": "分层回撤卖出"
 })
 
 # =========================
 # 19. 输出
 # =========================
-output_file = f"./MA策略_中证800_{end_date}.xlsx"
+output_file = f"./金叉买入_分层回撤卖出策略_中证800_{end_date}.xlsx"
 
 with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
     nav.to_frame("净值").to_excel(writer, sheet_name="净值")
     stats.to_excel(writer, sheet_name="策略指标", index=False)
     position_df.to_excel(writer, sheet_name="每日持仓", index=False)
     golden_df.to_excel(writer, sheet_name="当日金叉", index=False)
-    death_df.to_excel(writer, sheet_name="当日死叉", index=False)
+    stop_df.to_excel(writer, sheet_name="当日回撤卖出", index=False)
 
 print("输出完成：", output_file)
 
