@@ -31,15 +31,11 @@ VOLUME_RATIO_MAX_BONUS_BASE = 1.0
 SIGNAL_MAX_DAILY_RETURN = 0.05
 
 BREAKEVEN_PROFIT_THRESHOLD = 0.05
-PROFIT_TIER_1_THRESHOLD = 0.10
-PROFIT_TIER_2_THRESHOLD = 0.30
-PROFIT_TIER_3_THRESHOLD = 0.60
-PROFIT_TIER_4_THRESHOLD = 1.00
-PROFIT_TIER_1_REMAIN = 0.60
-PROFIT_TIER_2_REMAIN = 0.65
-PROFIT_TIER_3_REMAIN = 0.70
-PROFIT_TIER_4_REMAIN = 0.75
-PROFIT_TIER_5_REMAIN = 0.80
+MID_PROFIT_THRESHOLD = 0.30
+HIGH_PROFIT_THRESHOLD = 1.00
+LOW_PROFIT_REMAIN = 0.60
+MID_PROFIT_REMAIN = 0.70
+HIGH_PROFIT_REMAIN = 0.89
 LOOKBACK_DAYS = 1600
 TRADE_START_DATE = "2022-04-03"  # 必须写成字符串，例如 "2025-01-01"；None 表示沿用当前逻辑
 CACHE_PREFIX = "中证800"
@@ -103,6 +99,24 @@ def calculate_golden_cross_score_details(ma5_df, ma60_df, volume_df):
     }
 
 
+def get_dynamic_retrace_remain(max_profit):
+    if max_profit < BREAKEVEN_PROFIT_THRESHOLD:
+        return np.nan
+    if max_profit <= MID_PROFIT_THRESHOLD:
+        ratio = (
+            (max_profit - BREAKEVEN_PROFIT_THRESHOLD)
+            / (MID_PROFIT_THRESHOLD - BREAKEVEN_PROFIT_THRESHOLD)
+        )
+        return LOW_PROFIT_REMAIN + ratio * (MID_PROFIT_REMAIN - LOW_PROFIT_REMAIN)
+    if max_profit <= HIGH_PROFIT_THRESHOLD:
+        ratio = (
+            (max_profit - MID_PROFIT_THRESHOLD)
+            / (HIGH_PROFIT_THRESHOLD - MID_PROFIT_THRESHOLD)
+        )
+        return MID_PROFIT_REMAIN + ratio * (HIGH_PROFIT_REMAIN - MID_PROFIT_REMAIN)
+    return HIGH_PROFIT_REMAIN
+
+
 def evaluate_intraday_sell_signal(holding_info, open_price, low_price, high_price):
     entry_price = holding_info["entry_price"]
     prev_peak_price = holding_info["peak_price"]
@@ -126,37 +140,14 @@ def evaluate_intraday_sell_signal(holding_info, open_price, low_price, high_pric
                     open_price if open_price < entry_day_profit_stop_loss_price
                     else entry_day_profit_stop_loss_price
                 )
-                sell_reason_text = "买入日浮赢个股10%止损"
-    elif BREAKEVEN_PROFIT_THRESHOLD <= max_profit < PROFIT_TIER_1_THRESHOLD:
-        retrace_price = entry_price * (1 + max_profit * PROFIT_TIER_1_REMAIN)
+                sell_reason_text = "买入日浮赢个股12%止损"
+    elif max_profit >= BREAKEVEN_PROFIT_THRESHOLD:
+        retrace_remain = get_dynamic_retrace_remain(max_profit)
+        retrace_price = entry_price * (1 + max_profit * retrace_remain)
         monitor_level = retrace_price
         if low_price <= retrace_price:
             sell_price = open_price if open_price < retrace_price else retrace_price
-            sell_reason_text = "5%到10%浮赢后回撤止盈"
-    elif PROFIT_TIER_1_THRESHOLD <= max_profit < PROFIT_TIER_2_THRESHOLD:
-        retrace_price = entry_price * (1 + max_profit * PROFIT_TIER_2_REMAIN)
-        monitor_level = retrace_price
-        if low_price <= retrace_price:
-            sell_price = open_price if open_price < retrace_price else retrace_price
-            sell_reason_text = "10%到30%浮赢后回撤止盈"
-    elif PROFIT_TIER_2_THRESHOLD <= max_profit < PROFIT_TIER_3_THRESHOLD:
-        retrace_price = entry_price * (1 + max_profit * PROFIT_TIER_3_REMAIN)
-        monitor_level = retrace_price
-        if low_price <= retrace_price:
-            sell_price = open_price if open_price < retrace_price else retrace_price
-            sell_reason_text = "30%到60%浮赢后回撤止盈"
-    elif PROFIT_TIER_3_THRESHOLD <= max_profit < PROFIT_TIER_4_THRESHOLD:
-        retrace_price = entry_price * (1 + max_profit * PROFIT_TIER_4_REMAIN)
-        monitor_level = retrace_price
-        if low_price <= retrace_price:
-            sell_price = open_price if open_price < retrace_price else retrace_price
-            sell_reason_text = "60%到100%浮赢后回撤止盈"
-    elif max_profit >= PROFIT_TIER_4_THRESHOLD:
-        retrace_price = entry_price * (1 + max_profit * PROFIT_TIER_5_REMAIN)
-        monitor_level = retrace_price
-        if low_price <= retrace_price:
-            sell_price = open_price if open_price < retrace_price else retrace_price
-            sell_reason_text = "超过100%浮赢后回撤止盈"
+            sell_reason_text = "平滑动态回撤止盈"
 
     return {
         "sell_price": sell_price,
@@ -911,7 +902,7 @@ if not latest_intraday_stop_monitor_df.empty:
 # =========================
 output_dir = os.path.join(BASE_DIR, "输出")
 os.makedirs(output_dir, exist_ok=True)
-output_file = os.path.join(output_dir, f"金叉买入_分层回撤卖出策略_中证800_{end_date}.xlsx")
+output_file = os.path.join(output_dir, f"金叉买入_平滑动态回撤卖出策略_中证800_{end_date}.xlsx")
 
 with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
     nav_analysis.to_frame("净值").to_excel(writer, sheet_name="净值")
