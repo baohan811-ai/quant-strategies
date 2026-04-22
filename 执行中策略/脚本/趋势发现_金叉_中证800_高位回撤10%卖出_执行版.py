@@ -17,6 +17,9 @@ INITIAL_WEIGHT = 1 / MAX_HOLDINGS
 TRANSACTION_COST_RATE = 0.0025
 STOP_DRAWDOWN = 0.2
 PEAK_RETRACE_SELL_DRAWDOWN = 0.1
+LOW_EFFICIENCY_MIN_HOLDING_DAYS = 100
+LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD = 0.03
+LOW_EFFICIENCY_CURRENT_PROFIT_THRESHOLD = 0.00
 
 # 评分系统
 # total_score =
@@ -41,7 +44,7 @@ PROFIT_TIER_3_REMAIN = 0.70
 PROFIT_TIER_4_REMAIN = 0.75
 PROFIT_TIER_5_REMAIN = 0.80
 LOOKBACK_DAYS = 1600
-TRADE_START_DATE = "2022-04-03"  # 必须写成字符串，例如 "2025-01-01"；None 表示沿用当前逻辑
+TRADE_START_DATE = "2023-04-03"  # 必须写成字符串，例如 "2025-01-01"；None 表示沿用当前逻辑
 CACHE_PREFIX = "中证800"
 
 # =========================
@@ -489,6 +492,7 @@ sell_reason = pd.DataFrame("", index=close_df.index, columns=close_df.columns)
 sell_trigger_price = pd.DataFrame(np.nan, index=close_df.index, columns=close_df.columns)
 
 current_holdings = {}
+pending_open_sell_signals = {}
 cash = 1.0
 portfolio_values = []
 turnover_records = []
@@ -498,11 +502,12 @@ closed_trade_reasons = []
 closed_trade_holding_days = []
 latest_trade_date = close_df.index[-1]
 latest_intraday_stop_monitor_records = []
+latest_low_efficiency_sell_plan_records = []
 prev_date = None
 
 for date in close_df.index:
     traded_amount = 0.0
-    portfolio_before_buy = cash + sum(info["value"] for info in current_holdings.values())
+    sold_today = set()
 
     # 先把老持仓按昨收到今收更新市值
     if prev_date is not None:
@@ -513,12 +518,51 @@ for date in close_df.index:
                 continue
             current_holdings[code]["value"] *= price / prev_price
 
+    # 执行上一交易日收盘后确认的低效持仓卖出信号：今日开盘卖出。
+    for code, signal_info in list(pending_open_sell_signals.items()):
+        if code not in current_holdings:
+            del pending_open_sell_signals[code]
+            continue
+
+        open_price = open_df.at[date, code]
+        close_price = close_df.at[date, code]
+        if pd.isna(open_price) or pd.isna(close_price) or open_price <= 0 or close_price <= 0:
+            continue
+
+        holding_info = current_holdings[code]
+        sell_price = open_price
+        sell_value = holding_info["value"] * (sell_price / close_price)
+        buy_cost = holding_info["cost_basis"] * (1 + TRANSACTION_COST_RATE)
+        sell_proceeds = sell_value * (1 - TRANSACTION_COST_RATE)
+        trade_return = sell_proceeds / buy_cost - 1 if buy_cost > 0 else 0
+        holding_days = close_df.index.get_loc(date) - close_df.index.get_loc(holding_info["entry_date"])
+        closed_trade_returns.append(trade_return)
+        if trade_return > 0:
+            trade_outcome = "win"
+        else:
+            trade_outcome = "loss"
+        closed_trade_outcomes.append(trade_outcome)
+        closed_trade_reasons.append(signal_info["reason"])
+        closed_trade_holding_days.append(holding_days)
+        cash += sell_proceeds
+        traded_amount += sell_value
+        stop_signal.at[date, code] = True
+        sell_reason.at[date, code] = signal_info["reason"]
+        sell_trigger_price.at[date, code] = sell_price
+        sold_today.add(code)
+        del current_holdings[code]
+        del pending_open_sell_signals[code]
+
     # 先用前一日信号在今日开盘买入
+    portfolio_before_buy = cash + sum(info["value"] for info in current_holdings.values())
     available_slots = MAX_HOLDINGS - len(current_holdings)
     can_open_new_position = trade_start_ts is None or date >= trade_start_ts
     if can_open_new_position and available_slots > 0 and cash > 0:
         buy_candidates = buy_signal.columns[buy_signal.loc[date]].tolist()
-        buy_candidates = [code for code in buy_candidates if code not in current_holdings]
+        buy_candidates = [
+            code for code in buy_candidates
+            if code not in current_holdings and code not in sold_today
+        ]
 
         if buy_candidates:
             score_prev = candidate_score.loc[prev_date, buy_candidates].dropna().sort_values(ascending=False)
@@ -654,11 +698,54 @@ for date in close_df.index:
             stop_signal.at[date, code] = True
             sell_reason.at[date, code] = sell_reason_text
             sell_trigger_price.at[date, code] = sell_price
+            sold_today.add(code)
             del current_holdings[code]
+            pending_open_sell_signals.pop(code, None)
             continue
 
         # 当日高点只能在收盘后确认，因此仅用于更新下一交易日可用的峰值。
-        current_holdings[code]["peak_price"] = max(prev_peak_price, high_price)
+        updated_peak_price = max(prev_peak_price, high_price)
+        current_holdings[code]["peak_price"] = updated_peak_price
+
+        holding_days = close_df.index.get_loc(date) - close_df.index.get_loc(entry_date)
+        max_profit_after_update = updated_peak_price / entry_price - 1 if entry_price > 0 else -np.inf
+        current_profit = close_price / entry_price - 1 if entry_price > 0 else np.nan
+        is_low_efficiency_holding = (
+            holding_days > LOW_EFFICIENCY_MIN_HOLDING_DAYS
+            and (
+                max_profit_after_update <= LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD
+                or current_profit <= LOW_EFFICIENCY_CURRENT_PROFIT_THRESHOLD
+            )
+        )
+
+        if is_low_efficiency_holding:
+            low_efficiency_reason = (
+                f"低效持仓卖出：持有超过{LOW_EFFICIENCY_MIN_HOLDING_DAYS}个交易日，"
+                f"历史最高浮盈未超过{LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD:.0%}或当前浮盈不超过"
+                f"{LOW_EFFICIENCY_CURRENT_PROFIT_THRESHOLD:.0%}"
+            )
+            pending_open_sell_signals[code] = {
+                "signal_date": date,
+                "reason": low_efficiency_reason,
+                "holding_days": holding_days,
+                "max_profit": max_profit_after_update,
+                "current_profit": current_profit,
+            }
+            if date == latest_trade_date:
+                latest_low_efficiency_sell_plan_records.append({
+                    "代码": code,
+                    "名称": code_to_name.get(code, code),
+                    "开仓日期": entry_date,
+                    "开仓价": entry_price,
+                    "最新价": close_price,
+                    "持有交易日": holding_days,
+                    "历史最高浮盈": max_profit_after_update,
+                    "当前浮盈": current_profit,
+                    "计划动作": "下一交易日开盘卖出",
+                    "触发原因": low_efficiency_reason,
+                })
+        else:
+            pending_open_sell_signals.pop(code, None)
 
     portfolio_value = cash + sum(info["value"] for info in current_holdings.values())
     portfolio_values.append(portfolio_value)
@@ -804,13 +891,18 @@ for code, info in current_holdings.items():
     latest_price = close_df.at[today, code]
     entry_price = info["entry_price"]
     float_pnl = latest_price / entry_price - 1 if entry_price > 0 and pd.notna(latest_price) else np.nan
+    max_float_pnl = info["peak_price"] / entry_price - 1 if entry_price > 0 else np.nan
+    holding_days = close_df.index.get_loc(today) - close_df.index.get_loc(info["entry_date"])
     holding_records.append({
         "代码": code,
         "名称": code_to_name.get(code, code),
+        "开仓日期": info["entry_date"],
         "开仓价": entry_price,
         "最新价": latest_price,
         "最新市值": info["value"],
         "组合权重": position.at[today, code] if code in position.columns else 0.0,
+        "持有交易日": holding_days,
+        "历史最高浮盈": max_float_pnl,
         "浮赢浮亏": float_pnl
     })
 
@@ -862,13 +954,21 @@ stop_df = pd.DataFrame({
     "名称": [code_to_name.get(c, c) for c in stop_list],
     "触发原因": [sell_reason.at[today, c] for c in stop_list],
     "触发卖价": [sell_trigger_price.at[today, c] for c in stop_list],
-    "信号": "盘中触及回撤/止损条件并卖出"
+    "信号": "最新交易日卖出"
 })
 latest_intraday_stop_monitor_df = pd.DataFrame(latest_intraday_stop_monitor_records)
 if not latest_intraday_stop_monitor_df.empty:
     latest_intraday_stop_monitor_df = latest_intraday_stop_monitor_df.sort_values(
         by=["是否触发卖出", "历史最大浮盈"],
         ascending=[False, False],
+        na_position="last"
+    )
+
+latest_low_efficiency_sell_plan_df = pd.DataFrame(latest_low_efficiency_sell_plan_records)
+if not latest_low_efficiency_sell_plan_df.empty:
+    latest_low_efficiency_sell_plan_df = latest_low_efficiency_sell_plan_df.sort_values(
+        by=["持有交易日", "当前浮盈"],
+        ascending=[False, True],
         na_position="last"
     )
 
@@ -887,14 +987,16 @@ with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
     current_holding_df.to_excel(writer, sheet_name="当前持仓", index=False)
     golden_trigger_df.to_excel(writer, sheet_name="最新金叉触发", index=False)
     golden_exec_df.to_excel(writer, sheet_name="今日执行买入", index=False)
-    stop_df.to_excel(writer, sheet_name="最新交易日回撤卖出", index=False)
+    stop_df.to_excel(writer, sheet_name="最新交易日卖出", index=False)
     latest_intraday_stop_monitor_df.to_excel(writer, sheet_name="最新盘中卖出监控", index=False)
+    latest_low_efficiency_sell_plan_df.to_excel(writer, sheet_name="明日低效持仓卖出", index=False)
 
 print("\n【最新信号】")
 print(f"最新金叉触发数量: {len(golden_trigger_list)}")
 print(f"昨日金叉今日执行数量: {len(golden_exec_list)}")
-print(f"今日盘中触及回撤/止损并卖出数量: {len(stop_list)}")
+print(f"最新交易日卖出数量: {len(stop_list)}")
 print(f"最新盘中卖出监控数量: {len(latest_intraday_stop_monitor_df)}")
+print(f"明日低效持仓开盘卖出数量: {len(latest_low_efficiency_sell_plan_df)}")
 print(f"当前持仓数量: {len(current_holding_df)}")
 
 print("输出完成：", output_file)
