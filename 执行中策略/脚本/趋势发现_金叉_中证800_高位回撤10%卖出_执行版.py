@@ -490,6 +490,7 @@ position = pd.DataFrame(0.0, index=close_df.index, columns=close_df.columns)
 stop_signal = pd.DataFrame(False, index=close_df.index, columns=close_df.columns)
 sell_reason = pd.DataFrame("", index=close_df.index, columns=close_df.columns)
 sell_trigger_price = pd.DataFrame(np.nan, index=close_df.index, columns=close_df.columns)
+sell_float_pnl = pd.DataFrame(np.nan, index=close_df.index, columns=close_df.columns)
 
 current_holdings = {}
 pending_open_sell_signals = {}
@@ -549,6 +550,7 @@ for date in close_df.index:
         stop_signal.at[date, code] = True
         sell_reason.at[date, code] = signal_info["reason"]
         sell_trigger_price.at[date, code] = sell_price
+        sell_float_pnl.at[date, code] = sell_price / holding_info["entry_price"] - 1 if holding_info["entry_price"] > 0 else np.nan
         sold_today.add(code)
         del current_holdings[code]
         del pending_open_sell_signals[code]
@@ -698,6 +700,7 @@ for date in close_df.index:
             stop_signal.at[date, code] = True
             sell_reason.at[date, code] = sell_reason_text
             sell_trigger_price.at[date, code] = sell_price
+            sell_float_pnl.at[date, code] = sell_price / entry_price - 1 if entry_price > 0 else np.nan
             sold_today.add(code)
             del current_holdings[code]
             pending_open_sell_signals.pop(code, None)
@@ -954,6 +957,7 @@ stop_df = pd.DataFrame({
     "名称": [code_to_name.get(c, c) for c in stop_list],
     "触发原因": [sell_reason.at[today, c] for c in stop_list],
     "触发卖价": [sell_trigger_price.at[today, c] for c in stop_list],
+    "浮赢浮亏": [sell_float_pnl.at[today, c] for c in stop_list],
     "信号": "最新交易日卖出"
 })
 latest_intraday_stop_monitor_df = pd.DataFrame(latest_intraday_stop_monitor_records)
