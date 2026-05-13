@@ -31,6 +31,10 @@ MA60_5D_TREND_WEIGHT = 0.8
 VOLUME_RATIO_SCORE_WEIGHT = 0.5
 VOLUME_RATIO_LOOKBACK = 20
 VOLUME_RATIO_MAX_BONUS_BASE = 1.0
+
+# 金叉触发日最大涨幅过滤。
+# 已用本地中证800缓存行情做网格回测：3%~15%中，5%在收益、回撤、夏普之间最优；
+# 简单放宽到5.5%~7%会增加追高交易，组合表现反而下降。
 SIGNAL_MAX_DAILY_RETURN = 0.05
 
 BREAKEVEN_PROFIT_THRESHOLD = 0.05
@@ -479,7 +483,10 @@ candidate_score = score_details["total_score"]
 
 cross = signal.diff()
 
-golden_signal = (cross == 2) & ma60_up & ma120_up & limit_gain
+golden_cross_raw = cross == 2
+golden_cross_candidate = golden_cross_raw & ma60_up & ma120_up
+golden_signal = golden_cross_candidate & limit_gain
+hard_filter_excluded_signal = golden_cross_raw & ~golden_signal
 buy_signal = golden_signal.shift(1).fillna(False).astype(bool)
 
 # =========================
@@ -918,10 +925,12 @@ if not current_holding_df.empty:
 # =========================
 golden_trigger_today = golden_signal.loc[today]
 golden_exec_today = buy_signal.loc[today]
+hard_filter_excluded_today = hard_filter_excluded_signal.loc[today]
 stop_today = stop_signal.loc[today]
 
 golden_trigger_list = golden_trigger_today[golden_trigger_today].index.tolist()
 golden_exec_list = golden_exec_today[golden_exec_today].index.tolist()
+hard_filter_excluded_list = hard_filter_excluded_today[hard_filter_excluded_today].index.tolist()
 stop_list = stop_today[stop_today].index.tolist()
 
 golden_trigger_df = pd.DataFrame({
@@ -951,6 +960,66 @@ golden_exec_df = pd.DataFrame({
 })
 if not golden_exec_df.empty:
     golden_exec_df = golden_exec_df.sort_values(by="评分", ascending=False, na_position="last")
+
+def build_hard_filter_excluded_record(signal_date, code, prompt_text):
+    excluded_reasons = []
+    if not bool(ma60_up.at[signal_date, code]):
+        excluded_reasons.append("MA60未向上")
+    if not bool(ma120_up.at[signal_date, code]):
+        excluded_reasons.append("MA120未向上")
+    if not bool(limit_gain.at[signal_date, code]):
+        excluded_reasons.append("当日涨幅超过阈值")
+
+    return {
+        "日期": signal_date,
+        "代码": code,
+        "名称": code_to_name.get(code, code),
+        "评分": candidate_score.at[signal_date, code],
+        "当日涨幅": daily_ret.at[signal_date, code],
+        "涨幅阈值": SIGNAL_MAX_DAILY_RETURN,
+        "超出阈值": daily_ret.at[signal_date, code] - SIGNAL_MAX_DAILY_RETURN,
+        "MA60是否向上": "是" if bool(ma60_up.at[signal_date, code]) else "否",
+        "MA120是否向上": "是" if bool(ma120_up.at[signal_date, code]) else "否",
+        "涨幅是否合格": "是" if bool(limit_gain.at[signal_date, code]) else "否",
+        "剔除原因": "、".join(excluded_reasons),
+        "MA5相对MA60强度": score_ma5_ma60_gap.at[signal_date, code],
+        "MA60近5日趋势分": score_ma60_5d_trend.at[signal_date, code],
+        "量比": score_volume_ratio.at[signal_date, code],
+        "量比加分": score_volume_ratio_score.at[signal_date, code],
+        "20日平均成交额": avg_amount_20d.at[signal_date, code],
+        "提示": prompt_text
+    }
+
+hard_filter_excluded_records = []
+for code in hard_filter_excluded_list:
+    hard_filter_excluded_records.append(
+        build_hard_filter_excluded_record(
+            today,
+            code,
+            "今日发生MA5上穿MA60，但未通过硬性过滤条件"
+        )
+    )
+
+prev_trade_date = close_df.index[-2] if len(close_df.index) >= 2 else None
+if prev_trade_date is not None:
+    prev_filtered = hard_filter_excluded_signal.loc[prev_trade_date]
+    prev_filtered_list = prev_filtered[prev_filtered].index.tolist()
+    for code in prev_filtered_list:
+        hard_filter_excluded_records.append(
+            build_hard_filter_excluded_record(
+                prev_trade_date,
+                code,
+                "昨日发生MA5上穿MA60但被剔除，因此今日不执行买入"
+            )
+        )
+
+hard_filter_excluded_df = pd.DataFrame(hard_filter_excluded_records)
+if not hard_filter_excluded_df.empty:
+    hard_filter_excluded_df = hard_filter_excluded_df.sort_values(
+        by=["日期", "评分"],
+        ascending=[False, False],
+        na_position="last"
+    )
 
 stop_df = pd.DataFrame({
     "代码": stop_list,
@@ -991,6 +1060,7 @@ with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
     current_holding_df.to_excel(writer, sheet_name="当前持仓", index=False)
     golden_trigger_df.to_excel(writer, sheet_name="最新金叉触发", index=False)
     golden_exec_df.to_excel(writer, sheet_name="今日执行买入", index=False)
+    hard_filter_excluded_df.to_excel(writer, sheet_name="硬性条件剔除", index=False)
     stop_df.to_excel(writer, sheet_name="最新交易日卖出", index=False)
     latest_intraday_stop_monitor_df.to_excel(writer, sheet_name="最新盘中卖出监控", index=False)
     latest_low_efficiency_sell_plan_df.to_excel(writer, sheet_name="明日低效持仓卖出", index=False)
@@ -998,6 +1068,7 @@ with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
 print("\n【最新信号】")
 print(f"最新金叉触发数量: {len(golden_trigger_list)}")
 print(f"昨日金叉今日执行数量: {len(golden_exec_list)}")
+print(f"硬性条件剔除提示数量: {len(hard_filter_excluded_df)}")
 print(f"最新交易日卖出数量: {len(stop_list)}")
 print(f"最新盘中卖出监控数量: {len(latest_intraday_stop_monitor_df)}")
 print(f"明日低效持仓开盘卖出数量: {len(latest_low_efficiency_sell_plan_df)}")
