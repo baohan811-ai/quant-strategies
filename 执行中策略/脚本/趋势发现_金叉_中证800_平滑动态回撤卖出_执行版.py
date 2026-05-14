@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
+from local_market_db import MARKET_DB_PATH, ensure_market_data_updated, load_price_matrix
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(SCRIPT_DIR)
 CACHE_DIR = os.path.join(BASE_DIR, "缓存")
@@ -194,6 +196,9 @@ if TRADE_START_DATE is not None:
     if trade_start_dt > end_dt.date():
         raise ValueError("TRADE_START_DATE 不能晚于 end_date，请检查参数设置。")
 
+end_date = ensure_market_data_updated(w, end_date)
+end_dt = pd.Timestamp(end_date).to_pydatetime()
+
 # =========================
 # 4. 行情获取
 # =========================
@@ -382,86 +387,24 @@ def supplement_with_wsq(df, codes, field, trade_date):
 
 
 def get_price_df_with_cache(codes, field):
-    cached_df = load_cached_df(field)
-    if cached_df.empty:
-        print(f"{field} 未命中缓存，开始全量拉取")
-        full_df = get_wsd_batch(codes, field, start_date, end_date)
-        if full_df.empty:
-            raise ValueError(f"{field} 全量拉取失败，请检查 Wind 连接或字段权限。")
-        full_df = supplement_with_wsq(full_df, codes, field, end_date)
-        full_df = drop_all_nan_rows(full_df)
-        save_cached_df(field, full_df)
-        return full_df
-
-    cached_df = cached_df.loc[:, [c for c in cached_df.columns if c in codes]]
-    cached_codes = set(cached_df.columns)
-    missing_codes = [c for c in codes if c not in cached_codes]
-
-    incremental_df = pd.DataFrame()
-    if not cached_df.empty:
-        last_cached_ts = cached_df.index.max()
-        update_start_dt = last_cached_ts.date() + timedelta(days=1)
-        need_incremental = update_start_dt <= end_dt.date()
-    else:
-        need_incremental = False
-
-    if need_incremental:
-        print(f"{field} 命中缓存，增量更新: {update_start_dt.strftime('%Y-%m-%d')} ~ {end_date}")
-        incremental_df = get_wsd_batch(
-            list(cached_df.columns),
-            field,
-            update_start_dt.strftime("%Y-%m-%d"),
-            end_date
-        )
-
-    missing_df = pd.DataFrame()
-    if missing_codes:
-        print(f"{field} 新增股票 {len(missing_codes)} 只，补拉全历史")
-        missing_df = get_wsd_batch(missing_codes, field, start_date, end_date)
-
-    combined_df = cached_df
-    if not incremental_df.empty:
-        combined_df = pd.concat([combined_df, incremental_df], axis=0)
-    if not missing_df.empty:
-        combined_df = pd.concat([combined_df, missing_df], axis=1)
-
-    combined_df = combined_df.sort_index()
-    combined_df = combined_df.loc[:, ~combined_df.columns.duplicated()]
-    combined_df = combined_df[~combined_df.index.duplicated(keep="last")]
-    combined_df = combined_df.loc[:, [c for c in codes if c in combined_df.columns]]
-    combined_df = sanitize_price_df(combined_df)
-    combined_df = drop_all_nan_rows(combined_df)
-
-    combined_df = supplement_with_wsq(combined_df, codes, field, end_date)
-    combined_df = drop_all_nan_rows(combined_df)
-
-    if combined_df.empty:
-        raise ValueError(f"{field} 缓存读取后为空，请检查缓存文件或 Wind 拉取结果。")
-
-    if last_row_all_nan(combined_df):
-        cache_path = get_cache_path(field)
-        print(f"{field} 检测到缓存异常：最后一行整行空值，删除缓存并全量重拉")
-        if os.path.exists(cache_path):
-            os.remove(cache_path)
-
-        full_df = get_wsd_batch(codes, field, start_date, end_date)
-        if full_df.empty:
-            raise ValueError(f"{field} 重拉失败，请检查 Wind 连接、字段权限或当日数据是否已落库。")
-
-        full_df = full_df.sort_index()
-        full_df = full_df.loc[:, ~full_df.columns.duplicated()]
-        full_df = supplement_with_wsq(full_df, codes, field, end_date)
-        full_df = drop_all_nan_rows(full_df)
-
-        if full_df.empty or last_row_all_nan(full_df):
-            raise ValueError(
-                f"{field} 重拉后最后一行仍为空，疑似 Wind 当日 wsd/wsq 都未返回有效数据，请稍后再试。"
-            )
-
-        combined_df = full_df
-
-    save_cached_df(field, combined_df)
-    return combined_df
+    print(f"{field} 从本地行情数据库读取：{MARKET_DB_PATH}")
+    df = load_price_matrix(
+        CACHE_PREFIX,
+        field,
+        codes=codes,
+        start_date=start_date,
+        end_date=end_date,
+        target_columns=codes,
+        prefer_sqlite=True,
+        fallback_pickle=False,
+    )
+    df = sanitize_price_df(df)
+    df = drop_all_nan_rows(df)
+    df = supplement_with_wsq(df, codes, field, end_date)
+    df = drop_all_nan_rows(df)
+    if df.empty:
+        raise ValueError(f"{field} 从本地行情数据库读取为空，请先运行 update_local_market_db.py 更新日行情。")
+    return df
 
 # =========================
 # 5. 行情
@@ -474,6 +417,11 @@ volume_df = get_price_df_with_cache(stock_codes, "volume")
 amt_df = get_price_df_with_cache(stock_codes, "amt")
 
 print("行情维度：", close_df.shape)
+latest_data_ts = close_df.index[-1]
+if latest_data_ts.strftime("%Y-%m-%d") != end_date:
+    print(f"实际最新行情日期为 {latest_data_ts.strftime('%Y-%m-%d')}，策略输出日期同步调整。")
+end_dt = latest_data_ts.to_pydatetime()
+end_date = latest_data_ts.strftime("%Y-%m-%d")
 
 # =========================
 # 6. 均线

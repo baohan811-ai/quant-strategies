@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.marketdb.daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
+        <string>/Users/han/Documents/PJ1/执行中策略/脚本/daily_update_local_market_db.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/han/Documents/PJ1/执行中策略</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>16</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/han/Documents/PJ1/执行中策略/输出/logs/local_market_db_daily.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/han/Documents/PJ1/执行中策略/输出/logs/local_market_db_daily.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

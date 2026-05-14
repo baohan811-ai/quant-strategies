@@ -3,3 +3,18 @@ __pycache__/
 .DS_Store
 ~$*.xlsx
 *.xlsx
+
+# Local market/fundamental data caches
+执行中策略/缓存/
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+*.db-shm
+*.db-wal
+*.pkl
+
+# Generated reports and logs
+执行中策略/输出/
+*.html.zip
