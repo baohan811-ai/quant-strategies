@@ -128,76 +128,62 @@
 	      white-space: nowrap;
 	    }
 	    .industry-chart {
-	      display: grid;
-	      grid-template-columns: 132px minmax(0, 1fr);
-	      gap: 18px;
-	      align-items: center;
 	      padding: 18px;
 	      border-bottom: 1px solid var(--line);
 	      background: #ffffff;
 	    }
-	    .pie-wrap {
-	      position: relative;
-	      width: 118px;
-	      height: 118px;
-	    }
-	    .pie-wrap svg {
-	      display: block;
-	      width: 118px;
-	      height: 118px;
-	    }
-	    .pie-segment {
-	      transition: opacity 0.15s ease;
-	    }
-	    .pie-center {
-	      position: absolute;
-	      inset: 0;
+	    .industry-chart-head {
 	      display: flex;
-	      flex-direction: column;
-	      align-items: center;
-	      justify-content: center;
-	      pointer-events: none;
+	      align-items: baseline;
+	      justify-content: space-between;
+	      gap: 12px;
+	      margin-bottom: 12px;
 	    }
-	    .pie-center strong {
-	      font-size: 22px;
-	      line-height: 1;
+	    .industry-chart-head strong {
+	      font-size: 14px;
 	    }
-	    .pie-center span {
-	      margin-top: 4px;
+	    .industry-chart-head span {
 	      color: var(--muted);
 	      font-size: 12px;
 	    }
-	    .industry-list {
+	    .industry-bar-list {
 	      display: grid;
-	      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-	      gap: 8px 16px;
+	      gap: 9px;
 	    }
-	    .industry-row {
+	    .industry-bar-row {
 	      display: grid;
-	      grid-template-columns: 10px minmax(0, 1fr) auto auto;
-	      gap: 8px;
+	      grid-template-columns: minmax(92px, 150px) minmax(140px, 1fr) 36px 54px;
+	      gap: 10px;
 	      align-items: center;
-	      min-height: 24px;
+	      min-height: 26px;
 	      color: #344054;
 	      font-size: 13px;
-	    }
-	    .industry-dot {
-	      width: 10px;
-	      height: 10px;
-	      border-radius: 999px;
 	    }
 	    .industry-name {
 	      overflow: hidden;
 	      text-overflow: ellipsis;
 	      white-space: nowrap;
 	    }
+	    .industry-bar-track {
+	      height: 10px;
+	      background: #eef2f6;
+	      border-radius: 999px;
+	      overflow: hidden;
+	    }
+	    .industry-bar-fill {
+	      height: 100%;
+	      background: #1f7a8c;
+	      border-radius: 999px;
+	    }
 	    .industry-count {
 	      color: var(--text);
 	      font-variant-numeric: tabular-nums;
+	      text-align: right;
 	    }
 	    .industry-ratio {
 	      color: var(--muted);
 	      font-variant-numeric: tabular-nums;
+	      text-align: right;
 	    }
 	    .table-wrap {
 	      overflow-x: auto;
@@ -234,14 +220,14 @@
 	      .page { width: min(100vw - 28px, 1320px); padding-top: 22px; }
 	      .topbar { align-items: start; flex-direction: column; }
 	      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-	      .industry-chart { grid-template-columns: 1fr; }
-	      .pie-wrap { margin: 0 auto; }
 	      h1 { font-size: 24px; }
 	    }
-    @media (max-width: 560px) {
-      .metrics { grid-template-columns: 1fr; }
-      .metric-main { font-size: 32px; }
-    }
+	    @media (max-width: 560px) {
+	      .metrics { grid-template-columns: 1fr; }
+	      .industry-chart-head { align-items: start; flex-direction: column; }
+	      .industry-bar-row { grid-template-columns: minmax(72px, 104px) minmax(96px, 1fr) 30px 48px; gap: 8px; }
+	      .metric-main { font-size: 32px; }
+	    }
   </style>
 </head>
 <body>
@@ -251,7 +237,7 @@
         <h1>全球主要股票池最新金叉信号</h1>
         <div class="subtitle">观察窗口：2025-08-28 至 2026-05-15，MA5 上穿 MA60</div>
       </div>
-      <div class="generated">生成时间：2026-05-15 16:05:26</div>
+      <div class="generated">生成时间：2026-05-15 16:14:00</div>
     </header>
 
     <section class="metrics">
@@ -271,9 +257,9 @@
             <span class="market-name">全部港股</span>
             <span class="date-chip">2026-05-15</span>
           </div>
-          <div class="metric-main">38</div>
-          <div class="metric-sub">金叉 / 2719 只，覆盖 1.40%</div>
-          <div class="bar-track"><div class="bar-fill" style="width:88.4%"></div></div>
+          <div class="metric-main">39</div>
+          <div class="metric-sub">金叉 / 2719 只，覆盖 1.43%</div>
+          <div class="bar-track"><div class="bar-fill" style="width:90.7%"></div></div>
         </section>
         
         <section class="metric-card">
@@ -305,208 +291,100 @@
             <span>信号日期：2026-05-15 · 43 个信号</span>
           </div>
           
-    <div class="industry-chart">
-      <div class="pie-wrap">
-        <svg viewBox="0 0 100 100" aria-hidden="true">
-          <circle cx="50" cy="50" r="42" fill="none" stroke="#eef2f6" stroke-width="16" />
-          <g transform="rotate(-90 50 50)">
-            
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#1f7a8c"
-            stroke-width="16"
-            stroke-dasharray="18.411 245.483"
-            stroke-dashoffset="0.000"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#b45309"
-            stroke-width="16"
-            stroke-dasharray="6.137 257.757"
-            stroke-dashoffset="-18.411"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#5b6c2f"
-            stroke-width="16"
-            stroke-dasharray="24.548 239.346"
-            stroke-dashoffset="-24.548"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#7c3aed"
-            stroke-width="16"
-            stroke-dasharray="42.959 220.934"
-            stroke-dashoffset="-49.097"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#c2410c"
-            stroke-width="16"
-            stroke-dasharray="55.234 208.660"
-            stroke-dashoffset="-92.056"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#0f766e"
-            stroke-width="16"
-            stroke-dasharray="6.137 257.757"
-            stroke-dashoffset="-147.290"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#be123c"
-            stroke-width="16"
-            stroke-dasharray="6.137 257.757"
-            stroke-dashoffset="-153.427"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#2563eb"
-            stroke-width="16"
-            stroke-dasharray="85.919 177.975"
-            stroke-dashoffset="-159.564"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#64748b"
-            stroke-width="16"
-            stroke-dasharray="12.274 251.620"
-            stroke-dashoffset="-245.483"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#a16207"
-            stroke-width="16"
-            stroke-dasharray="6.137 257.757"
-            stroke-dashoffset="-257.757"
-          />
-        
-          </g>
-        </svg>
-        <div class="pie-center">
-          <strong>43</strong>
-          <span>信号</span>
-        </div>
+    <div class="industry-chart industry-bars">
+      <div class="industry-chart-head">
+        <strong>行业分布</strong>
+        <span>43 个信号，按个股数量降序</span>
       </div>
-      <div class="industry-list">
+      <div class="industry-bar-list">
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#1f7a8c"></span>
-            <span class="industry-name">信息技术</span>
-            <span class="industry-count">3 只</span>
-            <span class="industry-ratio">7.0%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#b45309"></span>
-            <span class="industry-name">公用事业</span>
-            <span class="industry-count">1 只</span>
-            <span class="industry-ratio">2.3%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#5b6c2f"></span>
-            <span class="industry-name">医疗保健</span>
-            <span class="industry-count">4 只</span>
-            <span class="industry-ratio">9.3%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#7c3aed"></span>
-            <span class="industry-name">可选消费</span>
-            <span class="industry-count">7 只</span>
-            <span class="industry-ratio">16.3%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#c2410c"></span>
-            <span class="industry-name">工业</span>
-            <span class="industry-count">9 只</span>
-            <span class="industry-ratio">20.9%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#0f766e"></span>
-            <span class="industry-name">房地产</span>
-            <span class="industry-count">1 只</span>
-            <span class="industry-ratio">2.3%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#be123c"></span>
-            <span class="industry-name">日常消费</span>
-            <span class="industry-count">1 只</span>
-            <span class="industry-ratio">2.3%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#2563eb"></span>
+          <div class="industry-bar-row">
             <span class="industry-name">材料</span>
-            <span class="industry-count">14 只</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:100.0%"></div>
+            </div>
+            <span class="industry-count">14</span>
             <span class="industry-ratio">32.6%</span>
           </div>
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#64748b"></span>
+          <div class="industry-bar-row">
+            <span class="industry-name">工业</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:64.3%"></div>
+            </div>
+            <span class="industry-count">9</span>
+            <span class="industry-ratio">20.9%</span>
+          </div>
+        
+          <div class="industry-bar-row">
+            <span class="industry-name">可选消费</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:50.0%"></div>
+            </div>
+            <span class="industry-count">7</span>
+            <span class="industry-ratio">16.3%</span>
+          </div>
+        
+          <div class="industry-bar-row">
+            <span class="industry-name">医疗保健</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:28.6%"></div>
+            </div>
+            <span class="industry-count">4</span>
+            <span class="industry-ratio">9.3%</span>
+          </div>
+        
+          <div class="industry-bar-row">
+            <span class="industry-name">信息技术</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:21.4%"></div>
+            </div>
+            <span class="industry-count">3</span>
+            <span class="industry-ratio">7.0%</span>
+          </div>
+        
+          <div class="industry-bar-row">
             <span class="industry-name">通讯服务</span>
-            <span class="industry-count">2 只</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:14.3%"></div>
+            </div>
+            <span class="industry-count">2</span>
             <span class="industry-ratio">4.7%</span>
           </div>
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#a16207"></span>
+          <div class="industry-bar-row">
+            <span class="industry-name">公用事业</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:7.1%"></div>
+            </div>
+            <span class="industry-count">1</span>
+            <span class="industry-ratio">2.3%</span>
+          </div>
+        
+          <div class="industry-bar-row">
+            <span class="industry-name">房地产</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:7.1%"></div>
+            </div>
+            <span class="industry-count">1</span>
+            <span class="industry-ratio">2.3%</span>
+          </div>
+        
+          <div class="industry-bar-row">
+            <span class="industry-name">日常消费</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:7.1%"></div>
+            </div>
+            <span class="industry-count">1</span>
+            <span class="industry-ratio">2.3%</span>
+          </div>
+        
+          <div class="industry-bar-row">
             <span class="industry-name">金融</span>
-            <span class="industry-count">1 只</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:7.1%"></div>
+            </div>
+            <span class="industry-count">1</span>
             <span class="industry-ratio">2.3%</span>
           </div>
         
@@ -526,212 +404,104 @@
         <section class="section">
           <div class="section-title">
             <h2>全部港股</h2>
-            <span>信号日期：2026-05-15 · 38 个信号</span>
+            <span>信号日期：2026-05-15 · 39 个信号</span>
           </div>
           
-    <div class="industry-chart">
-      <div class="pie-wrap">
-        <svg viewBox="0 0 100 100" aria-hidden="true">
-          <circle cx="50" cy="50" r="42" fill="none" stroke="#eef2f6" stroke-width="16" />
-          <g transform="rotate(-90 50 50)">
-            
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#1f7a8c"
-            stroke-width="16"
-            stroke-dasharray="27.778 236.115"
-            stroke-dashoffset="0.000"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#b45309"
-            stroke-width="16"
-            stroke-dasharray="6.945 256.949"
-            stroke-dashoffset="-27.778"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#5b6c2f"
-            stroke-width="16"
-            stroke-dasharray="6.945 256.949"
-            stroke-dashoffset="-34.723"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#7c3aed"
-            stroke-width="16"
-            stroke-dasharray="27.778 236.115"
-            stroke-dashoffset="-41.667"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#c2410c"
-            stroke-width="16"
-            stroke-dasharray="62.501 201.393"
-            stroke-dashoffset="-69.446"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#0f766e"
-            stroke-width="16"
-            stroke-dasharray="55.557 208.337"
-            stroke-dashoffset="-131.947"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#be123c"
-            stroke-width="16"
-            stroke-dasharray="27.778 236.115"
-            stroke-dashoffset="-187.503"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#2563eb"
-            stroke-width="16"
-            stroke-dasharray="13.889 250.005"
-            stroke-dashoffset="-215.282"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#64748b"
-            stroke-width="16"
-            stroke-dasharray="20.834 243.060"
-            stroke-dashoffset="-229.171"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#a16207"
-            stroke-width="16"
-            stroke-dasharray="13.889 250.005"
-            stroke-dashoffset="-250.005"
-          />
-        
-          </g>
-        </svg>
-        <div class="pie-center">
-          <strong>38</strong>
-          <span>信号</span>
-        </div>
+    <div class="industry-chart industry-bars">
+      <div class="industry-chart-head">
+        <strong>行业分布</strong>
+        <span>39 个信号，按个股数量降序</span>
       </div>
-      <div class="industry-list">
+      <div class="industry-bar-list">
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#1f7a8c"></span>
-            <span class="industry-name">信息技术</span>
-            <span class="industry-count">4 只</span>
-            <span class="industry-ratio">10.5%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#b45309"></span>
-            <span class="industry-name">公用事业</span>
-            <span class="industry-count">1 只</span>
-            <span class="industry-ratio">2.6%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#5b6c2f"></span>
-            <span class="industry-name">医疗保健</span>
-            <span class="industry-count">1 只</span>
-            <span class="industry-ratio">2.6%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#7c3aed"></span>
-            <span class="industry-name">可选消费</span>
-            <span class="industry-count">4 只</span>
-            <span class="industry-ratio">10.5%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#c2410c"></span>
+          <div class="industry-bar-row">
             <span class="industry-name">工业</span>
-            <span class="industry-count">9 只</span>
-            <span class="industry-ratio">23.7%</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:100.0%"></div>
+            </div>
+            <span class="industry-count">9</span>
+            <span class="industry-ratio">23.1%</span>
           </div>
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#0f766e"></span>
+          <div class="industry-bar-row">
             <span class="industry-name">房地产</span>
-            <span class="industry-count">8 只</span>
-            <span class="industry-ratio">21.1%</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:88.9%"></div>
+            </div>
+            <span class="industry-count">8</span>
+            <span class="industry-ratio">20.5%</span>
           </div>
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#be123c"></span>
+          <div class="industry-bar-row">
+            <span class="industry-name">可选消费</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:55.6%"></div>
+            </div>
+            <span class="industry-count">5</span>
+            <span class="industry-ratio">12.8%</span>
+          </div>
+        
+          <div class="industry-bar-row">
+            <span class="industry-name">信息技术</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:44.4%"></div>
+            </div>
+            <span class="industry-count">4</span>
+            <span class="industry-ratio">10.3%</span>
+          </div>
+        
+          <div class="industry-bar-row">
             <span class="industry-name">日常消费</span>
-            <span class="industry-count">4 只</span>
-            <span class="industry-ratio">10.5%</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:44.4%"></div>
+            </div>
+            <span class="industry-count">4</span>
+            <span class="industry-ratio">10.3%</span>
           </div>
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#2563eb"></span>
-            <span class="industry-name">材料</span>
-            <span class="industry-count">2 只</span>
-            <span class="industry-ratio">5.3%</span>
-          </div>
-        
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#64748b"></span>
+          <div class="industry-bar-row">
             <span class="industry-name">通讯服务</span>
-            <span class="industry-count">3 只</span>
-            <span class="industry-ratio">7.9%</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:33.3%"></div>
+            </div>
+            <span class="industry-count">3</span>
+            <span class="industry-ratio">7.7%</span>
           </div>
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#a16207"></span>
+          <div class="industry-bar-row">
+            <span class="industry-name">材料</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:22.2%"></div>
+            </div>
+            <span class="industry-count">2</span>
+            <span class="industry-ratio">5.1%</span>
+          </div>
+        
+          <div class="industry-bar-row">
             <span class="industry-name">金融</span>
-            <span class="industry-count">2 只</span>
-            <span class="industry-ratio">5.3%</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:22.2%"></div>
+            </div>
+            <span class="industry-count">2</span>
+            <span class="industry-ratio">5.1%</span>
+          </div>
+        
+          <div class="industry-bar-row">
+            <span class="industry-name">公用事业</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:11.1%"></div>
+            </div>
+            <span class="industry-count">1</span>
+            <span class="industry-ratio">2.6%</span>
+          </div>
+        
+          <div class="industry-bar-row">
+            <span class="industry-name">医疗保健</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:11.1%"></div>
+            </div>
+            <span class="industry-count">1</span>
+            <span class="industry-ratio">2.6%</span>
           </div>
         
       </div>
@@ -741,7 +511,7 @@
     <div class="table-wrap">
       <table>
         <thead><tr><th>代码</th><th>名称</th><th>万得一级行业</th><th>最新收盘</th></tr></thead>
-        <tbody><tr><td>2658.HK</td><td>天域半导体</td><td>信息技术</td><td>56.20</td></tr><tr><td>6613.HK</td><td>蓝思科技</td><td>信息技术</td><td>21.92</td></tr><tr><td>2076.HK</td><td>BOSS直聘-W</td><td>信息技术</td><td>55.95</td></tr><tr><td>9918.HK</td><td>丽年国际</td><td>信息技术</td><td>1.08</td></tr><tr><td>2886.HK</td><td>滨海投资</td><td>公用事业</td><td>1.11</td></tr><tr><td>2181.HK</td><td>迈博药业-B</td><td>医疗保健</td><td>0.51</td></tr><tr><td>1823.HK</td><td>华昱高速</td><td>可选消费</td><td>1.65</td></tr><tr><td>3978.HK</td><td>卓越教育集团</td><td>可选消费</td><td>3.33</td></tr><tr><td>8300.HK</td><td>今米房集团</td><td>可选消费</td><td>0.04</td></tr><tr><td>0176.HK</td><td>先机企业集团</td><td>可选消费</td><td>0.01</td></tr><tr><td>9900.HK</td><td>智云科技建设</td><td>工业</td><td>6.05</td></tr><tr><td>3816.HK</td><td>KFM金德</td><td>工业</td><td>2.48</td></tr><tr><td>1979.HK</td><td>天宝集团</td><td>工业</td><td>2.79</td></tr><tr><td>0144.HK</td><td>招商局港口</td><td>工业</td><td>16.53</td></tr><tr><td>8023.HK</td><td>邝文记</td><td>工业</td><td>0.37</td></tr><tr><td>1766.HK</td><td>中国中车</td><td>工业</td><td>5.33</td></tr><tr><td>0936.HK</td><td>佳兆业资本</td><td>工业</td><td>0.30</td></tr><tr><td>8549.HK</td><td>金叶国际集团</td><td>工业</td><td>0.29</td></tr><tr><td>6038.HK</td><td>信越控股</td><td>工业</td><td>0.40</td></tr><tr><td>0199.HK</td><td>德祥地产</td><td>房地产</td><td>1.04</td></tr><tr><td>6626.HK</td><td>越秀服务</td><td>房地产</td><td>1.83</td></tr><tr><td>0214.HK</td><td>汇汉控股</td><td>房地产</td><td>0.28</td></tr><tr><td>0583.HK</td><td>长城环亚控股</td><td>房地产</td><td>0.25</td></tr><tr><td>1224.HK</td><td>中渝置地</td><td>房地产</td><td>1.21</td></tr><tr><td>2231.HK</td><td>景业名邦集团</td><td>房地产</td><td>0.04</td></tr><tr><td>0726.HK</td><td>筑友智造科技</td><td>房地产</td><td>0.04</td></tr><tr><td>2329.HK</td><td>国瑞健康</td><td>房地产</td><td>0.11</td></tr><tr><td>2549.HK</td><td>卡罗特</td><td>日常消费</td><td>4.82</td></tr><tr><td>0197.HK</td><td>亨泰</td><td>日常消费</td><td>0.31</td></tr><tr><td>0954.HK</td><td>常茂生物</td><td>日常消费</td><td>0.34</td></tr><tr><td>0841.HK</td><td>木薯资源</td><td>日常消费</td><td>0.19</td></tr><tr><td>1118.HK</td><td>高力集团</td><td>材料</td><td>1.17</td></tr><tr><td>1252.HK</td><td>中国天瑞水泥</td><td>材料</td><td>0.24</td></tr><tr><td>1000.HK</td><td>北青传媒</td><td>通讯服务</td><td>0.71</td></tr><tr><td>0150.HK</td><td>HYPEBEAST</td><td>通讯服务</td><td>0.17</td></tr><tr><td>0072.HK</td><td>超媒体控股</td><td>通讯服务</td><td>0.25</td></tr><tr><td>1835.HK</td><td>瑞威资管</td><td>金融</td><td>1.20</td></tr><tr><td>1551.HK</td><td>广州农商银行</td><td>金融</td><td>1.50</td></tr></tbody>
+        <tbody><tr><td>2658.HK</td><td>天域半导体</td><td>信息技术</td><td>56.65</td></tr><tr><td>6613.HK</td><td>蓝思科技</td><td>信息技术</td><td>21.92</td></tr><tr><td>9918.HK</td><td>丽年国际</td><td>信息技术</td><td>1.08</td></tr><tr><td>2076.HK</td><td>BOSS直聘-W</td><td>信息技术</td><td>55.70</td></tr><tr><td>2886.HK</td><td>滨海投资</td><td>公用事业</td><td>1.11</td></tr><tr><td>2181.HK</td><td>迈博药业-B</td><td>医疗保健</td><td>0.51</td></tr><tr><td>1823.HK</td><td>华昱高速</td><td>可选消费</td><td>1.65</td></tr><tr><td>8412.HK</td><td>新爱德集团</td><td>可选消费</td><td>0.43</td></tr><tr><td>3978.HK</td><td>卓越教育集团</td><td>可选消费</td><td>3.33</td></tr><tr><td>8300.HK</td><td>今米房集团</td><td>可选消费</td><td>0.04</td></tr><tr><td>0176.HK</td><td>先机企业集团</td><td>可选消费</td><td>0.01</td></tr><tr><td>9900.HK</td><td>智云科技建设</td><td>工业</td><td>6.13</td></tr><tr><td>3816.HK</td><td>KFM金德</td><td>工业</td><td>2.48</td></tr><tr><td>1979.HK</td><td>天宝集团</td><td>工业</td><td>2.79</td></tr><tr><td>8023.HK</td><td>邝文记</td><td>工业</td><td>0.37</td></tr><tr><td>0936.HK</td><td>佳兆业资本</td><td>工业</td><td>0.30</td></tr><tr><td>1766.HK</td><td>中国中车</td><td>工业</td><td>5.32</td></tr><tr><td>8549.HK</td><td>金叶国际集团</td><td>工业</td><td>0.29</td></tr><tr><td>6038.HK</td><td>信越控股</td><td>工业</td><td>0.40</td></tr><tr><td>1897.HK</td><td>美亨实业</td><td>工业</td><td>0.48</td></tr><tr><td>0199.HK</td><td>德祥地产</td><td>房地产</td><td>1.04</td></tr><tr><td>6626.HK</td><td>越秀服务</td><td>房地产</td><td>1.82</td></tr><tr><td>0214.HK</td><td>汇汉控股</td><td>房地产</td><td>0.28</td></tr><tr><td>0583.HK</td><td>长城环亚控股</td><td>房地产</td><td>0.25</td></tr><tr><td>1224.HK</td><td>中渝置地</td><td>房地产</td><td>1.21</td></tr><tr><td>2231.HK</td><td>景业名邦集团</td><td>房地产</td><td>0.04</td></tr><tr><td>0726.HK</td><td>筑友智造科技</td><td>房地产</td><td>0.04</td></tr><tr><td>2329.HK</td><td>国瑞健康</td><td>房地产</td><td>0.11</td></tr><tr><td>2549.HK</td><td>卡罗特</td><td>日常消费</td><td>4.82</td></tr><tr><td>0197.HK</td><td>亨泰</td><td>日常消费</td><td>0.31</td></tr><tr><td>0954.HK</td><td>常茂生物</td><td>日常消费</td><td>0.34</td></tr><tr><td>0841.HK</td><td>木薯资源</td><td>日常消费</td><td>0.19</td></tr><tr><td>1118.HK</td><td>高力集团</td><td>材料</td><td>1.17</td></tr><tr><td>1252.HK</td><td>中国天瑞水泥</td><td>材料</td><td>0.24</td></tr><tr><td>1000.HK</td><td>北青传媒</td><td>通讯服务</td><td>0.71</td></tr><tr><td>0150.HK</td><td>HYPEBEAST</td><td>通讯服务</td><td>0.17</td></tr><tr><td>0072.HK</td><td>超媒体控股</td><td>通讯服务</td><td>0.25</td></tr><tr><td>1835.HK</td><td>瑞威资管</td><td>金融</td><td>1.20</td></tr><tr><td>1551.HK</td><td>广州农商银行</td><td>金融</td><td>1.50</td></tr></tbody>
       </table>
     </div>
     
@@ -753,75 +523,37 @@
             <span>信号日期：2026-05-14 · 3 个信号</span>
           </div>
           
-    <div class="industry-chart">
-      <div class="pie-wrap">
-        <svg viewBox="0 0 100 100" aria-hidden="true">
-          <circle cx="50" cy="50" r="42" fill="none" stroke="#eef2f6" stroke-width="16" />
-          <g transform="rotate(-90 50 50)">
-            
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#1f7a8c"
-            stroke-width="16"
-            stroke-dasharray="87.965 175.929"
-            stroke-dashoffset="0.000"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#b45309"
-            stroke-width="16"
-            stroke-dasharray="87.965 175.929"
-            stroke-dashoffset="-87.965"
-          />
-        
-          <circle
-            class="pie-segment"
-            cx="50"
-            cy="50"
-            r="42"
-            fill="none"
-            stroke="#5b6c2f"
-            stroke-width="16"
-            stroke-dasharray="87.965 175.929"
-            stroke-dashoffset="-175.929"
-          />
-        
-          </g>
-        </svg>
-        <div class="pie-center">
-          <strong>3</strong>
-          <span>信号</span>
-        </div>
+    <div class="industry-chart industry-bars">
+      <div class="industry-chart-head">
+        <strong>行业分布</strong>
+        <span>3 个信号，按个股数量降序</span>
       </div>
-      <div class="industry-list">
+      <div class="industry-bar-list">
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#1f7a8c"></span>
+          <div class="industry-bar-row">
             <span class="industry-name">公用事业</span>
-            <span class="industry-count">1 只</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:100.0%"></div>
+            </div>
+            <span class="industry-count">1</span>
             <span class="industry-ratio">33.3%</span>
           </div>
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#b45309"></span>
+          <div class="industry-bar-row">
             <span class="industry-name">日常消费</span>
-            <span class="industry-count">1 只</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:100.0%"></div>
+            </div>
+            <span class="industry-count">1</span>
             <span class="industry-ratio">33.3%</span>
           </div>
         
-          <div class="industry-row">
-            <span class="industry-dot" style="background:#5b6c2f"></span>
+          <div class="industry-bar-row">
             <span class="industry-name">金融</span>
-            <span class="industry-count">1 只</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:100.0%"></div>
+            </div>
+            <span class="industry-count">1</span>
             <span class="industry-ratio">33.3%</span>
           </div>
         
