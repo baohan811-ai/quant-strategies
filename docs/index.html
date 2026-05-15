@@ -129,45 +129,68 @@
 	    }
 	    .heat-chart {
 	      display: grid;
-	      gap: 12px;
+	      grid-template-columns: repeat(2, minmax(0, 1fr));
+	      gap: 16px;
 	      padding: 18px;
 	    }
-	    .heat-row {
-	      display: grid;
-	      grid-template-columns: minmax(84px, 128px) minmax(160px, 1fr) 52px minmax(260px, 360px);
+	    .heat-market-card {
+	      border: 1px solid #edf0f5;
+	      border-radius: 8px;
+	      padding: 14px;
+	      background: #fbfcfe;
+	    }
+	    .heat-market-head {
+	      display: flex;
+	      align-items: baseline;
+	      justify-content: space-between;
 	      gap: 12px;
-	      align-items: center;
-	      min-height: 30px;
-	      font-size: 13px;
+	      margin-bottom: 12px;
 	    }
-	    .heat-market {
-	      font-weight: 680;
-	      overflow: hidden;
-	      text-overflow: ellipsis;
-	      white-space: nowrap;
+	    .heat-market-head strong {
+	      font-size: 14px;
 	    }
-	    .heat-bar-track {
-	      height: 12px;
-	      background: #eef2f6;
-	      border-radius: 999px;
-	      overflow: hidden;
-	    }
-	    .heat-bar-fill {
-	      height: 100%;
-	      background: #b45309;
-	      border-radius: 999px;
-	    }
-	    .heat-count {
-	      font-weight: 720;
-	      text-align: right;
-	      font-variant-numeric: tabular-nums;
-	    }
-	    .heat-meta {
+	    .heat-market-head span {
 	      color: var(--muted);
 	      font-size: 12px;
 	      overflow: hidden;
 	      text-overflow: ellipsis;
 	      white-space: nowrap;
+	    }
+	    .heat-bars {
+	      display: grid;
+	      grid-template-columns: repeat(30, minmax(10px, 1fr));
+	      gap: 4px;
+	      align-items: end;
+	      min-height: 132px;
+	      padding-top: 6px;
+	    }
+	    .heat-day {
+	      display: grid;
+	      grid-template-rows: 104px auto;
+	      gap: 6px;
+	      min-width: 0;
+	    }
+	    .heat-column-wrap {
+	      display: flex;
+	      align-items: end;
+	      height: 104px;
+	      background: #eef2f6;
+	      border-radius: 5px 5px 3px 3px;
+	      overflow: hidden;
+	    }
+	    .heat-column {
+	      width: 100%;
+	      background: #b45309;
+	      border-radius: 5px 5px 0 0;
+	    }
+	    .heat-day span {
+	      color: var(--muted);
+	      font-size: 10px;
+	      line-height: 1;
+	      text-align: center;
+	      white-space: nowrap;
+	      transform: rotate(-45deg);
+	      transform-origin: center top;
 	    }
 	    .industry-chart {
 	      padding: 18px;
@@ -262,17 +285,15 @@
 	      .page { width: min(100vw - 28px, 1320px); padding-top: 22px; }
 	      .topbar { align-items: start; flex-direction: column; }
 	      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-	      .heat-row { grid-template-columns: minmax(76px, 112px) minmax(120px, 1fr) 46px; }
-	      .heat-meta { grid-column: 2 / -1; }
+	      .heat-chart { grid-template-columns: 1fr; }
 	      h1 { font-size: 24px; }
 	    }
 	    @media (max-width: 560px) {
 	      .metrics { grid-template-columns: 1fr; }
-	      .heat-row { grid-template-columns: 1fr 42px; gap: 8px; }
-	      .heat-market { grid-column: 1 / -1; }
-	      .heat-bar-track { grid-column: 1; }
-	      .heat-count { grid-column: 2; grid-row: 2; }
-	      .heat-meta { grid-column: 1 / -1; }
+	      .heat-chart { padding: 14px; }
+	      .heat-market-head { align-items: start; flex-direction: column; }
+	      .heat-bars { gap: 3px; overflow-x: auto; padding-bottom: 8px; }
+	      .heat-day { min-width: 12px; }
 	      .industry-chart-head { align-items: start; flex-direction: column; }
 	      .industry-bar-row { grid-template-columns: minmax(72px, 104px) minmax(96px, 1fr) 30px 48px; gap: 8px; }
 	      .metric-main { font-size: 32px; }
@@ -286,7 +307,7 @@
         <h1>全球主要股票池最新金叉信号</h1>
         <div class="subtitle">观察窗口：2025-08-28 至 2026-05-15，MA5 上穿 MA60</div>
       </div>
-      <div class="generated">生成时间：2026-05-15 16:25:35</div>
+      <div class="generated">生成时间：2026-05-15 16:31:22</div>
     </header>
 
 	    <section class="metrics">
@@ -306,9 +327,9 @@
             <span class="market-name">全部港股</span>
             <span class="date-chip">2026-05-15</span>
           </div>
-          <div class="metric-main">39</div>
-          <div class="metric-sub">金叉 / 2719 只，覆盖 1.43%</div>
-          <div class="bar-track"><div class="bar-fill" style="width:90.7%"></div></div>
+          <div class="metric-main">38</div>
+          <div class="metric-sub">金叉 / 2719 只，覆盖 1.40%</div>
+          <div class="bar-track"><div class="bar-fill" style="width:88.4%"></div></div>
         </section>
         
         <section class="metric-card">
@@ -337,44 +358,888 @@
     <section class="section heat-section">
       <div class="section-title">
         <h2>近30日市场热度</h2>
-        <span>按累计金叉数量降序</span>
+        <span>每日金叉数量变化</span>
       </div>
       <div class="heat-chart">
         
-          <div class="heat-row">
-            <span class="heat-market">全部A股</span>
-            <div class="heat-bar-track">
-              <div class="heat-bar-fill" style="width:100.0%"></div>
+          <div class="heat-market-card">
+            <div class="heat-market-head">
+              <strong>全部A股</strong>
+              <span>2026-03-31 至 2026-05-15 · 合计 3298 · 日均 109.9</span>
             </div>
-            <span class="heat-count">3298</span>
-            <span class="heat-meta">日均 109.9 · 覆盖 59.8% · 2026-03-31 至 2026-05-15</span>
+            <div class="heat-bars">
+              
+              <div class="heat-day" title="2026-03-31: 62 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:26.1%"></div>
+                </div>
+                <span>03-31</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-01: 61 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:25.6%"></div>
+                </div>
+                <span>04-01</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-02: 75 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:31.5%"></div>
+                </div>
+                <span>04-02</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-03: 33 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:13.9%"></div>
+                </div>
+                <span>04-03</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-07: 39 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:16.4%"></div>
+                </div>
+                <span>04-07</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-08: 65 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:27.3%"></div>
+                </div>
+                <span>04-08</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-09: 56 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:23.5%"></div>
+                </div>
+                <span>04-09</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-10: 110 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:46.2%"></div>
+                </div>
+                <span>04-10</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-13: 151 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:63.4%"></div>
+                </div>
+                <span>04-13</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-14: 143 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:60.1%"></div>
+                </div>
+                <span>04-14</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-15: 89 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:37.4%"></div>
+                </div>
+                <span>04-15</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-16: 113 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:47.5%"></div>
+                </div>
+                <span>04-16</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-17: 106 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:44.5%"></div>
+                </div>
+                <span>04-17</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-20: 126 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:52.9%"></div>
+                </div>
+                <span>04-20</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-21: 144 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:60.5%"></div>
+                </div>
+                <span>04-21</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-22: 143 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:60.1%"></div>
+                </div>
+                <span>04-22</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-23: 86 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:36.1%"></div>
+                </div>
+                <span>04-23</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-24: 71 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:29.8%"></div>
+                </div>
+                <span>04-24</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-27: 73 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:30.7%"></div>
+                </div>
+                <span>04-27</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-28: 76 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:31.9%"></div>
+                </div>
+                <span>04-28</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-29: 109 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:45.8%"></div>
+                </div>
+                <span>04-29</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-30: 136 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:57.1%"></div>
+                </div>
+                <span>04-30</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-06: 190 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:79.8%"></div>
+                </div>
+                <span>05-06</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-07: 172 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:72.3%"></div>
+                </div>
+                <span>05-07</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-08: 225 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:94.5%"></div>
+                </div>
+                <span>05-08</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-11: 238 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:100.0%"></div>
+                </div>
+                <span>05-11</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-12: 165 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:69.3%"></div>
+                </div>
+                <span>05-12</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-13: 131 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:55.0%"></div>
+                </div>
+                <span>05-13</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-14: 67 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:28.2%"></div>
+                </div>
+                <span>05-14</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-15: 43 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:18.1%"></div>
+                </div>
+                <span>05-15</span>
+              </div>
+            
+            </div>
           </div>
         
-          <div class="heat-row">
-            <span class="heat-market">全部港股</span>
-            <div class="heat-bar-track">
-              <div class="heat-bar-fill" style="width:41.9%"></div>
+          <div class="heat-market-card">
+            <div class="heat-market-head">
+              <strong>全部港股</strong>
+              <span>2026-04-02 至 2026-05-15 · 合计 1383 · 日均 46.1</span>
             </div>
-            <span class="heat-count">1383</span>
-            <span class="heat-meta">日均 46.1 · 覆盖 50.9% · 2026-04-02 至 2026-05-15</span>
+            <div class="heat-bars">
+              
+              <div class="heat-day" title="2026-04-02: 36 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:45.6%"></div>
+                </div>
+                <span>04-02</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-03: 40 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:50.6%"></div>
+                </div>
+                <span>04-03</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-07: 39 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:49.4%"></div>
+                </div>
+                <span>04-07</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-08: 57 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:72.2%"></div>
+                </div>
+                <span>04-08</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-09: 34 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:43.0%"></div>
+                </div>
+                <span>04-09</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-10: 44 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:55.7%"></div>
+                </div>
+                <span>04-10</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-13: 49 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:62.0%"></div>
+                </div>
+                <span>04-13</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-14: 58 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:73.4%"></div>
+                </div>
+                <span>04-14</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-15: 32 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:40.5%"></div>
+                </div>
+                <span>04-15</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-16: 36 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:45.6%"></div>
+                </div>
+                <span>04-16</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-17: 42 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:53.2%"></div>
+                </div>
+                <span>04-17</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-20: 48 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:60.8%"></div>
+                </div>
+                <span>04-20</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-21: 42 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:53.2%"></div>
+                </div>
+                <span>04-21</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-22: 34 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:43.0%"></div>
+                </div>
+                <span>04-22</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-23: 44 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:55.7%"></div>
+                </div>
+                <span>04-23</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-24: 41 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:51.9%"></div>
+                </div>
+                <span>04-24</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-27: 27 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:34.2%"></div>
+                </div>
+                <span>04-27</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-28: 32 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:40.5%"></div>
+                </div>
+                <span>04-28</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-29: 37 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:46.8%"></div>
+                </div>
+                <span>04-29</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-30: 50 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:63.3%"></div>
+                </div>
+                <span>04-30</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-04: 58 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:73.4%"></div>
+                </div>
+                <span>05-04</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-05: 62 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:78.5%"></div>
+                </div>
+                <span>05-05</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-06: 51 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:64.6%"></div>
+                </div>
+                <span>05-06</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-07: 51 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:64.6%"></div>
+                </div>
+                <span>05-07</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-08: 72 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:91.1%"></div>
+                </div>
+                <span>05-08</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-11: 79 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:100.0%"></div>
+                </div>
+                <span>05-11</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-12: 53 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:67.1%"></div>
+                </div>
+                <span>05-12</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-13: 50 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:63.3%"></div>
+                </div>
+                <span>05-13</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-14: 47 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:59.5%"></div>
+                </div>
+                <span>05-14</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-15: 38 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:48.1%"></div>
+                </div>
+                <span>05-15</span>
+              </div>
+            
+            </div>
           </div>
         
-          <div class="heat-row">
-            <span class="heat-market">标普500</span>
-            <div class="heat-bar-track">
-              <div class="heat-bar-fill" style="width:10.4%"></div>
+          <div class="heat-market-card">
+            <div class="heat-market-head">
+              <strong>标普500</strong>
+              <span>2026-04-02 至 2026-05-14 · 合计 342 · 日均 11.4</span>
             </div>
-            <span class="heat-count">342</span>
-            <span class="heat-meta">日均 11.4 · 覆盖 68.0% · 2026-04-02 至 2026-05-14</span>
+            <div class="heat-bars">
+              
+              <div class="heat-day" title="2026-04-02: 7 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:19.4%"></div>
+                </div>
+                <span>04-02</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-06: 14 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:38.9%"></div>
+                </div>
+                <span>04-06</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-07: 14 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:38.9%"></div>
+                </div>
+                <span>04-07</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-08: 24 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:66.7%"></div>
+                </div>
+                <span>04-08</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-09: 25 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:69.4%"></div>
+                </div>
+                <span>04-09</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-10: 22 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:61.1%"></div>
+                </div>
+                <span>04-10</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-13: 15 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:41.7%"></div>
+                </div>
+                <span>04-13</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-14: 19 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:52.8%"></div>
+                </div>
+                <span>04-14</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-15: 7 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:19.4%"></div>
+                </div>
+                <span>04-15</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-16: 13 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:36.1%"></div>
+                </div>
+                <span>04-16</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-17: 36 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:100.0%"></div>
+                </div>
+                <span>04-17</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-20: 15 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:41.7%"></div>
+                </div>
+                <span>04-20</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-21: 14 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:38.9%"></div>
+                </div>
+                <span>04-21</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-22: 10 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:27.8%"></div>
+                </div>
+                <span>04-22</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-23: 11 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:30.6%"></div>
+                </div>
+                <span>04-23</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-24: 8 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>04-24</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-27: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:5.6%"></div>
+                </div>
+                <span>04-27</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-28: 4 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:11.1%"></div>
+                </div>
+                <span>04-28</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-29: 10 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:27.8%"></div>
+                </div>
+                <span>04-29</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-30: 5 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:13.9%"></div>
+                </div>
+                <span>04-30</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-01: 9 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:25.0%"></div>
+                </div>
+                <span>05-01</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-04: 6 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:16.7%"></div>
+                </div>
+                <span>05-04</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-05: 8 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>05-05</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-06: 16 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:44.4%"></div>
+                </div>
+                <span>05-06</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-07: 11 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:30.6%"></div>
+                </div>
+                <span>05-07</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-08: 4 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:11.1%"></div>
+                </div>
+                <span>05-08</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-11: 6 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:16.7%"></div>
+                </div>
+                <span>05-11</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-12: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:5.6%"></div>
+                </div>
+                <span>05-12</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-13: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:5.6%"></div>
+                </div>
+                <span>05-13</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-14: 3 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:8.3%"></div>
+                </div>
+                <span>05-14</span>
+              </div>
+            
+            </div>
           </div>
         
-          <div class="heat-row">
-            <span class="heat-market">纳斯达克100</span>
-            <div class="heat-bar-track">
-              <div class="heat-bar-fill" style="width:4.0%"></div>
+          <div class="heat-market-card">
+            <div class="heat-market-head">
+              <strong>纳斯达克100</strong>
+              <span>2026-04-02 至 2026-05-14 · 合计 73 · 日均 2.4</span>
             </div>
-            <span class="heat-count">73</span>
-            <span class="heat-meta">日均 2.4 · 覆盖 72.3% · 2026-04-02 至 2026-05-14</span>
+            <div class="heat-bars">
+              
+              <div class="heat-day" title="2026-04-02: 0 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:0.0%"></div>
+                </div>
+                <span>04-02</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-06: 8 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:88.9%"></div>
+                </div>
+                <span>04-06</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-07: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>04-07</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-08: 1 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:11.1%"></div>
+                </div>
+                <span>04-08</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-09: 5 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:55.6%"></div>
+                </div>
+                <span>04-09</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-10: 5 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:55.6%"></div>
+                </div>
+                <span>04-10</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-13: 5 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:55.6%"></div>
+                </div>
+                <span>04-13</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-14: 4 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:44.4%"></div>
+                </div>
+                <span>04-14</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-15: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>04-15</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-16: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>04-16</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-17: 9 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:100.0%"></div>
+                </div>
+                <span>04-17</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-20: 4 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:44.4%"></div>
+                </div>
+                <span>04-20</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-21: 4 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:44.4%"></div>
+                </div>
+                <span>04-21</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-22: 3 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:33.3%"></div>
+                </div>
+                <span>04-22</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-23: 1 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:11.1%"></div>
+                </div>
+                <span>04-23</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-24: 1 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:11.1%"></div>
+                </div>
+                <span>04-24</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-27: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>04-27</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-28: 0 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:0.0%"></div>
+                </div>
+                <span>04-28</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-29: 1 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:11.1%"></div>
+                </div>
+                <span>04-29</span>
+              </div>
+            
+              <div class="heat-day" title="2026-04-30: 1 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:11.1%"></div>
+                </div>
+                <span>04-30</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-01: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>05-01</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-04: 3 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:33.3%"></div>
+                </div>
+                <span>05-04</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-05: 1 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:11.1%"></div>
+                </div>
+                <span>05-05</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-06: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>05-06</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-07: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>05-07</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-08: 2 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:22.2%"></div>
+                </div>
+                <span>05-08</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-11: 1 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:11.1%"></div>
+                </div>
+                <span>05-11</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-12: 0 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:0.0%"></div>
+                </div>
+                <span>05-12</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-13: 0 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:0.0%"></div>
+                </div>
+                <span>05-13</span>
+              </div>
+            
+              <div class="heat-day" title="2026-05-14: 0 个金叉">
+                <div class="heat-column-wrap">
+                  <div class="heat-column" style="height:0.0%"></div>
+                </div>
+                <span>05-14</span>
+              </div>
+            
+            </div>
           </div>
         
       </div>
@@ -501,13 +1366,13 @@
         <section class="section">
           <div class="section-title">
             <h2>全部港股</h2>
-            <span>信号日期：2026-05-15 · 39 个信号</span>
+            <span>信号日期：2026-05-15 · 38 个信号</span>
           </div>
           
     <div class="industry-chart industry-bars">
       <div class="industry-chart-head">
         <strong>行业分布</strong>
-        <span>39 个信号，按个股数量降序</span>
+        <span>38 个信号，按个股数量降序</span>
       </div>
       <div class="industry-bar-list">
         
@@ -517,7 +1382,7 @@
               <div class="industry-bar-fill" style="width:100.0%"></div>
             </div>
             <span class="industry-count">9</span>
-            <span class="industry-ratio">23.1%</span>
+            <span class="industry-ratio">23.7%</span>
           </div>
         
           <div class="industry-bar-row">
@@ -526,7 +1391,7 @@
               <div class="industry-bar-fill" style="width:88.9%"></div>
             </div>
             <span class="industry-count">8</span>
-            <span class="industry-ratio">20.5%</span>
+            <span class="industry-ratio">21.1%</span>
           </div>
         
           <div class="industry-bar-row">
@@ -535,16 +1400,7 @@
               <div class="industry-bar-fill" style="width:55.6%"></div>
             </div>
             <span class="industry-count">5</span>
-            <span class="industry-ratio">12.8%</span>
-          </div>
-        
-          <div class="industry-bar-row">
-            <span class="industry-name">信息技术</span>
-            <div class="industry-bar-track">
-              <div class="industry-bar-fill" style="width:44.4%"></div>
-            </div>
-            <span class="industry-count">4</span>
-            <span class="industry-ratio">10.3%</span>
+            <span class="industry-ratio">13.2%</span>
           </div>
         
           <div class="industry-bar-row">
@@ -553,7 +1409,16 @@
               <div class="industry-bar-fill" style="width:44.4%"></div>
             </div>
             <span class="industry-count">4</span>
-            <span class="industry-ratio">10.3%</span>
+            <span class="industry-ratio">10.5%</span>
+          </div>
+        
+          <div class="industry-bar-row">
+            <span class="industry-name">信息技术</span>
+            <div class="industry-bar-track">
+              <div class="industry-bar-fill" style="width:33.3%"></div>
+            </div>
+            <span class="industry-count">3</span>
+            <span class="industry-ratio">7.9%</span>
           </div>
         
           <div class="industry-bar-row">
@@ -562,7 +1427,7 @@
               <div class="industry-bar-fill" style="width:33.3%"></div>
             </div>
             <span class="industry-count">3</span>
-            <span class="industry-ratio">7.7%</span>
+            <span class="industry-ratio">7.9%</span>
           </div>
         
           <div class="industry-bar-row">
@@ -571,7 +1436,7 @@
               <div class="industry-bar-fill" style="width:22.2%"></div>
             </div>
             <span class="industry-count">2</span>
-            <span class="industry-ratio">5.1%</span>
+            <span class="industry-ratio">5.3%</span>
           </div>
         
           <div class="industry-bar-row">
@@ -580,7 +1445,7 @@
               <div class="industry-bar-fill" style="width:22.2%"></div>
             </div>
             <span class="industry-count">2</span>
-            <span class="industry-ratio">5.1%</span>
+            <span class="industry-ratio">5.3%</span>
           </div>
         
           <div class="industry-bar-row">
@@ -608,7 +1473,7 @@
     <div class="table-wrap">
       <table>
         <thead><tr><th>代码</th><th>名称</th><th>万得一级行业</th><th>最新收盘</th></tr></thead>
-        <tbody><tr><td>2658.HK</td><td>天域半导体</td><td>信息技术</td><td>56.65</td></tr><tr><td>6613.HK</td><td>蓝思科技</td><td>信息技术</td><td>21.92</td></tr><tr><td>9918.HK</td><td>丽年国际</td><td>信息技术</td><td>1.08</td></tr><tr><td>2076.HK</td><td>BOSS直聘-W</td><td>信息技术</td><td>55.70</td></tr><tr><td>2886.HK</td><td>滨海投资</td><td>公用事业</td><td>1.11</td></tr><tr><td>2181.HK</td><td>迈博药业-B</td><td>医疗保健</td><td>0.51</td></tr><tr><td>1823.HK</td><td>华昱高速</td><td>可选消费</td><td>1.65</td></tr><tr><td>8412.HK</td><td>新爱德集团</td><td>可选消费</td><td>0.43</td></tr><tr><td>3978.HK</td><td>卓越教育集团</td><td>可选消费</td><td>3.33</td></tr><tr><td>8300.HK</td><td>今米房集团</td><td>可选消费</td><td>0.04</td></tr><tr><td>0176.HK</td><td>先机企业集团</td><td>可选消费</td><td>0.01</td></tr><tr><td>9900.HK</td><td>智云科技建设</td><td>工业</td><td>6.13</td></tr><tr><td>3816.HK</td><td>KFM金德</td><td>工业</td><td>2.48</td></tr><tr><td>1979.HK</td><td>天宝集团</td><td>工业</td><td>2.79</td></tr><tr><td>8023.HK</td><td>邝文记</td><td>工业</td><td>0.37</td></tr><tr><td>0936.HK</td><td>佳兆业资本</td><td>工业</td><td>0.30</td></tr><tr><td>1766.HK</td><td>中国中车</td><td>工业</td><td>5.32</td></tr><tr><td>8549.HK</td><td>金叶国际集团</td><td>工业</td><td>0.29</td></tr><tr><td>6038.HK</td><td>信越控股</td><td>工业</td><td>0.40</td></tr><tr><td>1897.HK</td><td>美亨实业</td><td>工业</td><td>0.48</td></tr><tr><td>0199.HK</td><td>德祥地产</td><td>房地产</td><td>1.04</td></tr><tr><td>6626.HK</td><td>越秀服务</td><td>房地产</td><td>1.82</td></tr><tr><td>0214.HK</td><td>汇汉控股</td><td>房地产</td><td>0.28</td></tr><tr><td>0583.HK</td><td>长城环亚控股</td><td>房地产</td><td>0.25</td></tr><tr><td>1224.HK</td><td>中渝置地</td><td>房地产</td><td>1.21</td></tr><tr><td>2231.HK</td><td>景业名邦集团</td><td>房地产</td><td>0.04</td></tr><tr><td>0726.HK</td><td>筑友智造科技</td><td>房地产</td><td>0.04</td></tr><tr><td>2329.HK</td><td>国瑞健康</td><td>房地产</td><td>0.11</td></tr><tr><td>2549.HK</td><td>卡罗特</td><td>日常消费</td><td>4.82</td></tr><tr><td>0197.HK</td><td>亨泰</td><td>日常消费</td><td>0.31</td></tr><tr><td>0954.HK</td><td>常茂生物</td><td>日常消费</td><td>0.34</td></tr><tr><td>0841.HK</td><td>木薯资源</td><td>日常消费</td><td>0.19</td></tr><tr><td>1118.HK</td><td>高力集团</td><td>材料</td><td>1.17</td></tr><tr><td>1252.HK</td><td>中国天瑞水泥</td><td>材料</td><td>0.24</td></tr><tr><td>1000.HK</td><td>北青传媒</td><td>通讯服务</td><td>0.71</td></tr><tr><td>0150.HK</td><td>HYPEBEAST</td><td>通讯服务</td><td>0.17</td></tr><tr><td>0072.HK</td><td>超媒体控股</td><td>通讯服务</td><td>0.25</td></tr><tr><td>1835.HK</td><td>瑞威资管</td><td>金融</td><td>1.20</td></tr><tr><td>1551.HK</td><td>广州农商银行</td><td>金融</td><td>1.50</td></tr></tbody>
+        <tbody><tr><td>2658.HK</td><td>天域半导体</td><td>信息技术</td><td>56.65</td></tr><tr><td>9918.HK</td><td>丽年国际</td><td>信息技术</td><td>1.08</td></tr><tr><td>2076.HK</td><td>BOSS直聘-W</td><td>信息技术</td><td>55.70</td></tr><tr><td>2886.HK</td><td>滨海投资</td><td>公用事业</td><td>1.11</td></tr><tr><td>2181.HK</td><td>迈博药业-B</td><td>医疗保健</td><td>0.51</td></tr><tr><td>1823.HK</td><td>华昱高速</td><td>可选消费</td><td>1.65</td></tr><tr><td>8412.HK</td><td>新爱德集团</td><td>可选消费</td><td>0.43</td></tr><tr><td>3978.HK</td><td>卓越教育集团</td><td>可选消费</td><td>3.33</td></tr><tr><td>8300.HK</td><td>今米房集团</td><td>可选消费</td><td>0.04</td></tr><tr><td>0176.HK</td><td>先机企业集团</td><td>可选消费</td><td>0.01</td></tr><tr><td>9900.HK</td><td>智云科技建设</td><td>工业</td><td>6.13</td></tr><tr><td>3816.HK</td><td>KFM金德</td><td>工业</td><td>2.48</td></tr><tr><td>1979.HK</td><td>天宝集团</td><td>工业</td><td>2.79</td></tr><tr><td>8023.HK</td><td>邝文记</td><td>工业</td><td>0.37</td></tr><tr><td>0936.HK</td><td>佳兆业资本</td><td>工业</td><td>0.30</td></tr><tr><td>1766.HK</td><td>中国中车</td><td>工业</td><td>5.32</td></tr><tr><td>8549.HK</td><td>金叶国际集团</td><td>工业</td><td>0.29</td></tr><tr><td>6038.HK</td><td>信越控股</td><td>工业</td><td>0.40</td></tr><tr><td>1897.HK</td><td>美亨实业</td><td>工业</td><td>0.48</td></tr><tr><td>0199.HK</td><td>德祥地产</td><td>房地产</td><td>1.04</td></tr><tr><td>6626.HK</td><td>越秀服务</td><td>房地产</td><td>1.82</td></tr><tr><td>0214.HK</td><td>汇汉控股</td><td>房地产</td><td>0.28</td></tr><tr><td>0583.HK</td><td>长城环亚控股</td><td>房地产</td><td>0.25</td></tr><tr><td>1224.HK</td><td>中渝置地</td><td>房地产</td><td>1.21</td></tr><tr><td>2231.HK</td><td>景业名邦集团</td><td>房地产</td><td>0.04</td></tr><tr><td>0726.HK</td><td>筑友智造科技</td><td>房地产</td><td>0.04</td></tr><tr><td>2329.HK</td><td>国瑞健康</td><td>房地产</td><td>0.11</td></tr><tr><td>2549.HK</td><td>卡罗特</td><td>日常消费</td><td>4.82</td></tr><tr><td>0197.HK</td><td>亨泰</td><td>日常消费</td><td>0.31</td></tr><tr><td>0954.HK</td><td>常茂生物</td><td>日常消费</td><td>0.34</td></tr><tr><td>0841.HK</td><td>木薯资源</td><td>日常消费</td><td>0.19</td></tr><tr><td>1118.HK</td><td>高力集团</td><td>材料</td><td>1.17</td></tr><tr><td>1252.HK</td><td>中国天瑞水泥</td><td>材料</td><td>0.24</td></tr><tr><td>1000.HK</td><td>北青传媒</td><td>通讯服务</td><td>0.71</td></tr><tr><td>0150.HK</td><td>HYPEBEAST</td><td>通讯服务</td><td>0.17</td></tr><tr><td>0072.HK</td><td>超媒体控股</td><td>通讯服务</td><td>0.25</td></tr><tr><td>1835.HK</td><td>瑞威资管</td><td>金融</td><td>1.20</td></tr><tr><td>1551.HK</td><td>广州农商银行</td><td>金融</td><td>1.50</td></tr></tbody>
       </table>
     </div>
     
