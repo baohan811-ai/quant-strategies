@@ -157,18 +157,20 @@
 	      white-space: nowrap;
 	    }
 	    .heat-bars {
-	      display: grid;
-	      grid-template-columns: repeat(30, minmax(10px, 1fr));
-	      gap: 4px;
+	      display: flex;
+	      gap: 8px;
 	      align-items: end;
 	      min-height: 132px;
 	      padding-top: 6px;
+	      overflow-x: auto;
+	      overflow-y: hidden;
+	      scrollbar-color: #cbd5e1 transparent;
 	    }
 	    .heat-day {
 	      display: grid;
 	      grid-template-rows: 104px auto;
 	      gap: 6px;
-	      min-width: 0;
+	      flex: 0 0 24px;
 	    }
 	    .heat-column-wrap {
 	      display: flex;
@@ -180,8 +182,8 @@
 	    }
 	    .heat-column {
 	      width: 100%;
-	      background: #b45309;
-	      border-radius: 5px 5px 0 0;
+	      background: linear-gradient(180deg, #2f9eb0, #1f7a8c);
+	      border-radius: 5px 5px 2px 2px;
 	    }
 	    .heat-day span {
 	      color: var(--muted);
@@ -189,7 +191,7 @@
 	      line-height: 1;
 	      text-align: center;
 	      white-space: nowrap;
-	      transform: rotate(-45deg);
+	      transform: rotate(-50deg);
 	      transform-origin: center top;
 	    }
 	    .industry-chart {
@@ -292,8 +294,8 @@
 	      .metrics { grid-template-columns: 1fr; }
 	      .heat-chart { padding: 14px; }
 	      .heat-market-head { align-items: start; flex-direction: column; }
-	      .heat-bars { gap: 3px; overflow-x: auto; padding-bottom: 8px; }
-	      .heat-day { min-width: 12px; }
+	      .heat-bars { gap: 7px; padding-bottom: 8px; }
+	      .heat-day { flex-basis: 22px; }
 	      .industry-chart-head { align-items: start; flex-direction: column; }
 	      .industry-bar-row { grid-template-columns: minmax(72px, 104px) minmax(96px, 1fr) 30px 48px; gap: 8px; }
 	      .metric-main { font-size: 32px; }
@@ -307,7 +309,7 @@
         <h1>全球主要股票池最新金叉信号</h1>
         <div class="subtitle">观察窗口：2025-08-28 至 2026-05-15，MA5 上穿 MA60</div>
       </div>
-      <div class="generated">生成时间：2026-05-15 16:31:22</div>
+      <div class="generated">生成时间：2026-05-15 16:35:28</div>
     </header>
 
 	    <section class="metrics">
@@ -357,8 +359,8 @@
 	    
     <section class="section heat-section">
       <div class="section-title">
-        <h2>近30日市场热度</h2>
-        <span>每日金叉数量变化</span>
+        <h2>过去30日各市场每日金叉数量统计</h2>
+        <span>横轴为日期，柱高为当日触发金叉的个股数量</span>
       </div>
       <div class="heat-chart">
         
