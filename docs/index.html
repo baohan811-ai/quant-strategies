@@ -99,9 +99,9 @@
       background: linear-gradient(90deg, var(--accent), var(--accent-2));
       border-radius: 999px;
     }
-    .section {
-      margin-top: 22px;
-      background: var(--panel);
+	    .section {
+	      margin-top: 22px;
+	      background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
       box-shadow: var(--shadow);
@@ -125,6 +125,48 @@
 	    .section-title span {
 	      color: var(--muted);
 	      font-size: 13px;
+	      white-space: nowrap;
+	    }
+	    .heat-chart {
+	      display: grid;
+	      gap: 12px;
+	      padding: 18px;
+	    }
+	    .heat-row {
+	      display: grid;
+	      grid-template-columns: minmax(84px, 128px) minmax(160px, 1fr) 52px minmax(260px, 360px);
+	      gap: 12px;
+	      align-items: center;
+	      min-height: 30px;
+	      font-size: 13px;
+	    }
+	    .heat-market {
+	      font-weight: 680;
+	      overflow: hidden;
+	      text-overflow: ellipsis;
+	      white-space: nowrap;
+	    }
+	    .heat-bar-track {
+	      height: 12px;
+	      background: #eef2f6;
+	      border-radius: 999px;
+	      overflow: hidden;
+	    }
+	    .heat-bar-fill {
+	      height: 100%;
+	      background: #b45309;
+	      border-radius: 999px;
+	    }
+	    .heat-count {
+	      font-weight: 720;
+	      text-align: right;
+	      font-variant-numeric: tabular-nums;
+	    }
+	    .heat-meta {
+	      color: var(--muted);
+	      font-size: 12px;
+	      overflow: hidden;
+	      text-overflow: ellipsis;
 	      white-space: nowrap;
 	    }
 	    .industry-chart {
@@ -220,10 +262,17 @@
 	      .page { width: min(100vw - 28px, 1320px); padding-top: 22px; }
 	      .topbar { align-items: start; flex-direction: column; }
 	      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+	      .heat-row { grid-template-columns: minmax(76px, 112px) minmax(120px, 1fr) 46px; }
+	      .heat-meta { grid-column: 2 / -1; }
 	      h1 { font-size: 24px; }
 	    }
 	    @media (max-width: 560px) {
 	      .metrics { grid-template-columns: 1fr; }
+	      .heat-row { grid-template-columns: 1fr 42px; gap: 8px; }
+	      .heat-market { grid-column: 1 / -1; }
+	      .heat-bar-track { grid-column: 1; }
+	      .heat-count { grid-column: 2; grid-row: 2; }
+	      .heat-meta { grid-column: 1 / -1; }
 	      .industry-chart-head { align-items: start; flex-direction: column; }
 	      .industry-bar-row { grid-template-columns: minmax(72px, 104px) minmax(96px, 1fr) 30px 48px; gap: 8px; }
 	      .metric-main { font-size: 32px; }
@@ -237,11 +286,11 @@
         <h1>全球主要股票池最新金叉信号</h1>
         <div class="subtitle">观察窗口：2025-08-28 至 2026-05-15，MA5 上穿 MA60</div>
       </div>
-      <div class="generated">生成时间：2026-05-15 16:14:00</div>
+      <div class="generated">生成时间：2026-05-15 16:25:35</div>
     </header>
 
-    <section class="metrics">
-      
+	    <section class="metrics">
+	      
         <section class="metric-card">
           <div class="metric-head">
             <span class="market-name">全部A股</span>
@@ -282,9 +331,57 @@
           <div class="bar-track"><div class="bar-fill" style="width:2.0%"></div></div>
         </section>
         
-    </section>
+	    </section>
 
+	    
+    <section class="section heat-section">
+      <div class="section-title">
+        <h2>近30日市场热度</h2>
+        <span>按累计金叉数量降序</span>
+      </div>
+      <div class="heat-chart">
+        
+          <div class="heat-row">
+            <span class="heat-market">全部A股</span>
+            <div class="heat-bar-track">
+              <div class="heat-bar-fill" style="width:100.0%"></div>
+            </div>
+            <span class="heat-count">3298</span>
+            <span class="heat-meta">日均 109.9 · 覆盖 59.8% · 2026-03-31 至 2026-05-15</span>
+          </div>
+        
+          <div class="heat-row">
+            <span class="heat-market">全部港股</span>
+            <div class="heat-bar-track">
+              <div class="heat-bar-fill" style="width:41.9%"></div>
+            </div>
+            <span class="heat-count">1383</span>
+            <span class="heat-meta">日均 46.1 · 覆盖 50.9% · 2026-04-02 至 2026-05-15</span>
+          </div>
+        
+          <div class="heat-row">
+            <span class="heat-market">标普500</span>
+            <div class="heat-bar-track">
+              <div class="heat-bar-fill" style="width:10.4%"></div>
+            </div>
+            <span class="heat-count">342</span>
+            <span class="heat-meta">日均 11.4 · 覆盖 68.0% · 2026-04-02 至 2026-05-14</span>
+          </div>
+        
+          <div class="heat-row">
+            <span class="heat-market">纳斯达克100</span>
+            <div class="heat-bar-track">
+              <div class="heat-bar-fill" style="width:4.0%"></div>
+            </div>
+            <span class="heat-count">73</span>
+            <span class="heat-meta">日均 2.4 · 覆盖 72.3% · 2026-04-02 至 2026-05-14</span>
+          </div>
+        
+      </div>
+    </section>
     
+
+	    
         <section class="section">
           <div class="section-title">
             <h2>全部A股</h2>
