@@ -8,7 +8,7 @@ import pandas as pd
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.dirname(SCRIPT_DIR)
+BASE_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 CACHE_DIR = os.path.join(BASE_DIR, "缓存")
 
 MARKET_DB_PATH = os.path.join(CACHE_DIR, "本地行情数据库.sqlite3")

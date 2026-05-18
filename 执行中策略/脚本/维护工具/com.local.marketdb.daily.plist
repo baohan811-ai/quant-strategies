@@ -9,7 +9,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
-        <string>/Users/han/Documents/PJ1/执行中策略/脚本/daily_update_local_market_db.py</string>
+        <string>/Users/han/Documents/PJ1/执行中策略/脚本/维护工具/daily_update_local_market_db.py</string>
     </array>
 
     <key>WorkingDirectory</key>

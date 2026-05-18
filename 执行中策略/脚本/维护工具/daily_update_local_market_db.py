@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.dirname(SCRIPT_DIR)
+BASE_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 LOG_DIR = os.path.join(BASE_DIR, "输出", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -16,8 +16,8 @@ def run_step(name, args):
 
 
 def main():
-    update_script = os.path.join("脚本", "update_local_market_db.py")
-    check_script = os.path.join("脚本", "check_local_market_db.py")
+    update_script = os.path.join("脚本", "维护工具", "update_local_market_db.py")
+    check_script = os.path.join("脚本", "维护工具", "check_local_market_db.py")
     eod_end_date = (datetime.today().date() - timedelta(days=1)).strftime("%Y-%m-%d")
 
     run_step("更新最近行情", [
