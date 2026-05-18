@@ -19,6 +19,7 @@ FUNDAMENTAL_FIELDS = {"pe_ttm", "pb_lf", "roe_ttm", "debt_to_assets"}
 A_SHARE_SECTOR_ID = "a001010100000000"
 DEFAULT_DAILY_PRICE_FIELDS = ["open", "high", "low", "close", "volume", "amt"]
 COMPLETE_EOD_PRICE_FIELDS = ["open", "high", "low", "close", "volume", "amt"]
+WIND_LEVEL1_INDUSTRY_SYSTEM = "wind_level1"
 
 
 def connect(db_path=MARKET_DB_PATH):
@@ -57,6 +58,18 @@ def init_market_db(db_path=MARKET_DB_PATH):
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS stock_industry (
+                classification_system TEXT NOT NULL,
+                wind_code TEXT NOT NULL,
+                sec_name TEXT,
+                industry_level1 TEXT,
+                source_field TEXT NOT NULL,
+                source_options TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (classification_system, wind_code)
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS fetch_batches (
                 dataset TEXT NOT NULL,
                 trade_date TEXT NOT NULL,
@@ -86,7 +99,11 @@ def init_market_db(db_path=MARKET_DB_PATH):
             CREATE INDEX IF NOT EXISTS idx_fetch_batches_status
             ON fetch_batches (status)
         """)
-        _set_metadata(conn, "schema_version", "1")
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_industry_level1
+            ON stock_industry (classification_system, industry_level1)
+        """)
+        _set_metadata(conn, "schema_version", "2")
         conn.commit()
 
 
@@ -203,6 +220,14 @@ def _set_metadata(conn, key, value):
             value = excluded.value,
             updated_at = excluded.updated_at
     """, (key, str(value), updated_at))
+
+
+def get_metadata(conn, key):
+    row = conn.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (key,),
+    ).fetchone()
+    return row[0] if row else None
 
 
 def _placeholders(values):
@@ -388,6 +413,41 @@ def load_universe_from_fundamental_db(db_path=A_SHARE_FUNDAMENTAL_DB_PATH):
             conn,
         )
     return df
+
+
+def load_stock_industry_map(
+    codes=None,
+    classification_system=WIND_LEVEL1_INDUSTRY_SYSTEM,
+    db_path=MARKET_DB_PATH,
+):
+    if not os.path.exists(db_path):
+        return {}
+
+    params = [classification_system]
+    conditions = ["classification_system = ?"]
+    if codes:
+        codes = list(codes)
+        conditions.append(f"wind_code IN ({_placeholders(codes)})")
+        params.extend(codes)
+
+    query = f"""
+        SELECT wind_code, industry_level1
+        FROM stock_industry
+        WHERE {' AND '.join(conditions)}
+    """
+    with sqlite3.connect(db_path) as conn:
+        table_exists = conn.execute("""
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'stock_industry'
+        """).fetchone()
+        if not table_exists:
+            return {}
+        df = pd.read_sql_query(query, conn, params=params)
+    if df.empty:
+        return {}
+    return dict(zip(df["wind_code"], df["industry_level1"]))
 
 
 def fundamental_coverage(db_path=A_SHARE_FUNDAMENTAL_DB_PATH):

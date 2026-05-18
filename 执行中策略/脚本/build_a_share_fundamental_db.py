@@ -12,8 +12,7 @@ CACHE_DIR = os.path.join(BASE_DIR, "缓存")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(CACHE_DIR, "全部A股_基础基本面.sqlite3")
-SECTOR_CACHE_PATH = os.path.join(CACHE_DIR, "全部A股_基础基本面_sector.pkl")
-SECTOR_CACHE_REFRESH_DAYS = 7
+SECTOR_REFRESH_DAYS = 7
 
 SECTOR_ID = "a001010100000000"
 START_DATE = "2022-01-01"
@@ -78,30 +77,49 @@ def init_db(conn):
     conn.commit()
 
 
-def load_cached_sector():
-    if not os.path.exists(SECTOR_CACHE_PATH):
+def load_stock_universe_from_db(conn, allow_stale=False):
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT wind_code, sec_name, updated_at
+            FROM stock_universe
+            ORDER BY wind_code
+            """,
+            conn,
+        )
+    except sqlite3.OperationalError:
         return None
-    cache_mtime = datetime.fromtimestamp(os.path.getmtime(SECTOR_CACHE_PATH))
-    if (datetime.now() - cache_mtime).days > SECTOR_CACHE_REFRESH_DAYS:
+
+    if df.empty or not {"wind_code", "sec_name", "updated_at"}.issubset(df.columns):
         return None
-    df = pd.read_pickle(SECTOR_CACHE_PATH)
-    if df.empty or not {"wind_code", "sec_name"}.issubset(df.columns):
+
+    latest_updated_at = pd.to_datetime(df["updated_at"], errors="coerce").max()
+    if pd.isna(latest_updated_at):
         return None
-    print(f"全部A股成分股命中缓存：{SECTOR_CACHE_PATH}")
-    return df
+    cache_age_days = (pd.Timestamp.now() - latest_updated_at).days
+    if not allow_stale and cache_age_days > SECTOR_REFRESH_DAYS:
+        print(f"全部A股成分股 SQLite 缓存已超过 {SECTOR_REFRESH_DAYS} 天，准备刷新")
+        return None
+
+    print(
+        "全部A股成分股命中 SQLite："
+        f"{len(df)} 只，updated_at={latest_updated_at.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    return df[["wind_code", "sec_name"]]
 
 
-def get_sector_constituents():
-    cached_df = load_cached_sector()
+def get_sector_constituents(conn):
+    cached_df = load_stock_universe_from_db(conn)
     if cached_df is not None:
         return cached_df
 
-    print("全部A股成分股未命中缓存，从 Wind 拉取")
+    print("全部A股成分股未命中 SQLite 或已过期，从 Wind 拉取")
     data = w.wset("sectorconstituent", f"sectorid={SECTOR_ID}")
     if data.ErrorCode != 0 or not data.Data:
-        if os.path.exists(SECTOR_CACHE_PATH):
-            print("成分股拉取失败，使用过期缓存")
-            return pd.read_pickle(SECTOR_CACHE_PATH)
+        stale_df = load_stock_universe_from_db(conn, allow_stale=True)
+        if stale_df is not None:
+            print("成分股拉取失败，使用 SQLite 过期股票池兜底")
+            return stale_df
         raise RuntimeError(f"全部A股成分股拉取失败: ErrorCode={data.ErrorCode}")
 
     code_idx = data.Fields.index("wind_code")
@@ -110,7 +128,6 @@ def get_sector_constituents():
         "wind_code": data.Data[code_idx],
         "sec_name": data.Data[name_idx],
     })
-    df.to_pickle(SECTOR_CACHE_PATH)
     return df
 
 
@@ -324,7 +341,7 @@ def main():
     conn = sqlite3.connect(DB_PATH)
     try:
         init_db(conn)
-        universe_df = get_sector_constituents()
+        universe_df = get_sector_constituents(conn)
         save_stock_universe(conn, universe_df)
         codes = universe_df["wind_code"].tolist()
         snapshot_dates = get_monthly_snapshot_dates(START_DATE, end_date)

@@ -12,6 +12,8 @@ from local_market_db import (
     COMPLETE_EOD_PRICE_FIELDS,
     MARKET_DB_PATH,
     PRICE_FIELDS,
+    WIND_LEVEL1_INDUSTRY_SYSTEM,
+    get_metadata,
     get_price_cache_path,
     init_market_db,
 )
@@ -25,6 +27,8 @@ DEFAULT_PRICE_FIELDS = ["open", "high", "low", "close", "volume", "amt"]
 DEFAULT_ADJUST_CHECK_DAYS = 10
 DEFAULT_ADJUST_TOLERANCE = 0.0001
 DEFAULT_INCREMENTAL_REFRESH_DAYS = 15
+DEFAULT_INDUSTRY_FIELD = "wicsname2024"
+DEFAULT_INDUSTRY_OPTIONS = "tradeDate={trade_date};industryType=1;"
 
 
 def import_price_pickle(cache_prefix, field, db_path=MARKET_DB_PATH, chunk_size=100000, adjusted="F"):
@@ -104,6 +108,66 @@ def save_stock_universe(conn, universe_name, universe_df):
     conn.commit()
 
 
+def quarter_key(date_value):
+    ts = pd.Timestamp(date_value)
+    quarter = (ts.month - 1) // 3 + 1
+    return f"{ts.year}Q{quarter}"
+
+
+def resolve_industry_options(options, end_date):
+    trade_date = pd.Timestamp(end_date).strftime("%Y%m%d")
+    trade_date_dash = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+    return options.format(
+        trade_date=trade_date,
+        trade_date_dash=trade_date_dash,
+    )
+
+
+def metadata_token(value):
+    return str(value).strip().replace(":", "_").replace(" ", "_")
+
+
+def save_stock_industries(
+    conn,
+    industry_df,
+    classification_system=WIND_LEVEL1_INDUSTRY_SYSTEM,
+    source_field=DEFAULT_INDUSTRY_FIELD,
+    source_options=DEFAULT_INDUSTRY_OPTIONS,
+):
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = [
+        (
+            classification_system,
+            row.wind_code,
+            row.sec_name,
+            row.industry_level1,
+            source_field,
+            source_options,
+            updated_at,
+        )
+        for row in industry_df.itertuples(index=False)
+    ]
+    conn.executemany("""
+        INSERT INTO stock_industry (
+            classification_system,
+            wind_code,
+            sec_name,
+            industry_level1,
+            source_field,
+            source_options,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(classification_system, wind_code) DO UPDATE SET
+            sec_name = excluded.sec_name,
+            industry_level1 = excluded.industry_level1,
+            source_field = excluded.source_field,
+            source_options = excluded.source_options,
+            updated_at = excluded.updated_at
+    """, rows)
+    conn.commit()
+
+
 def get_wind_sector_constituents(w, sector_id):
     print(f"从 Wind 拉取股票池：sectorid={sector_id}")
     data = w.wset("sectorconstituent", f"sectorid={sector_id}")
@@ -115,6 +179,116 @@ def get_wind_sector_constituents(w, sector_id):
         "wind_code": data.Data[code_idx],
         "sec_name": data.Data[name_idx],
     })
+
+
+def get_wind_industry_batch(w, universe_df, field, options, batch_size):
+    rows = []
+    codes = universe_df["wind_code"].tolist()
+    code_to_name = dict(zip(universe_df["wind_code"], universe_df["sec_name"]))
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i + batch_size]
+        print(f"拉取行业 {field}: {i}-{i + len(batch)} [{options}]")
+        data = w.wss(batch, field, options)
+        if data.ErrorCode != 0:
+            outmessage = ""
+            if getattr(data, "Data", None) and len(data.Data) > 0 and len(data.Data[0]) > 0:
+                outmessage = str(data.Data[0][0])
+            raise RuntimeError(
+                f"行业拉取失败: field={field}, options={options}, "
+                f"ErrorCode={data.ErrorCode}, OutMessage={outmessage}"
+            )
+        if not data.Data or len(data.Data) == 0:
+            values = [None] * len(batch)
+        else:
+            values = data.Data[0]
+        if len(values) != len(batch):
+            raise RuntimeError(
+                f"行业返回维度异常：codes={len(batch)}, values={len(values)}"
+            )
+        rows.extend(
+            {
+                "wind_code": code,
+                "sec_name": code_to_name.get(code),
+                "industry_level1": value,
+            }
+            for code, value in zip(batch, values)
+        )
+    return pd.DataFrame(rows)
+
+
+def update_industries_from_wind(
+    db_path,
+    universe_name,
+    sector_id,
+    end_date,
+    batch_size,
+    industry_field=DEFAULT_INDUSTRY_FIELD,
+    industry_options=DEFAULT_INDUSTRY_OPTIONS,
+    classification_system=WIND_LEVEL1_INDUSTRY_SYSTEM,
+    force=False,
+):
+    wind_started = False
+    current_quarter = quarter_key(end_date)
+    resolved_industry_options = resolve_industry_options(industry_options, end_date)
+    metadata_key = (
+        f"stock_industry:{classification_system}:"
+        f"{metadata_token(universe_name)}:last_update_quarter"
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        last_quarter = get_metadata(conn, metadata_key)
+        if last_quarter == current_quarter and not force:
+            print(f"行业映射本季度已更新：{last_quarter}，跳过。")
+            return
+
+        from WindPy import w
+
+        w.start()
+        wind_started = True
+        universe_df = get_wind_sector_constituents(w, sector_id)
+        save_stock_universe(conn, universe_name, universe_df)
+        industry_df = get_wind_industry_batch(
+            w,
+            universe_df,
+            industry_field,
+            resolved_industry_options,
+            batch_size,
+        )
+        save_stock_industries(
+            conn,
+            industry_df,
+            classification_system=classification_system,
+            source_field=industry_field,
+            source_options=resolved_industry_options,
+        )
+        non_null_count = int(industry_df["industry_level1"].notna().sum())
+        print(
+            f"行业映射更新完成：{len(industry_df)} 只，"
+            f"非空 {non_null_count} 只，季度={current_quarter}"
+        )
+        if non_null_count == 0:
+            print(
+                "提示：本次 Wind 字段返回全为空。可检查字段/权限，"
+                "或临时用 --industry-system sw_level1 "
+                "--industry-field industry_sw --industry-options industryType=1 验证。"
+            )
+        conn.execute("""
+            INSERT INTO metadata (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+        """, (
+            metadata_key,
+            current_quarter,
+            datetime.now().isoformat(timespec="seconds"),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+        if wind_started:
+            w.close()
 
 
 def iter_date_chunks(start_date, end_date, chunk="Y"):
@@ -569,6 +743,7 @@ def main():
     parser.add_argument("--fundamentals", action="store_true", help="运行全部A股基础基本面更新")
     parser.add_argument("--import-price-pkl", nargs="*", default=[], help="从现有 pkl 导入行情，例如：全部A股 中证800")
     parser.add_argument("--prices-from-wind", action="store_true", help="直接从 Wind 拉取日频行情写入 SQLite")
+    parser.add_argument("--industries-from-wind", action="store_true", help="从 Wind 拉取股票所属一级行业写入 SQLite，默认每季度更新一次")
     parser.add_argument("--smart-adjust-refresh", action="store_true", help="校验最近 close 偏差，仅回刷疑似除权复权变化个股")
     parser.add_argument("--universe-name", default="全部A股")
     parser.add_argument("--sector-id", default=A_SHARE_SECTOR_ID)
@@ -579,6 +754,10 @@ def main():
     parser.add_argument("--price-fields", nargs="*", default=DEFAULT_PRICE_FIELDS)
     parser.add_argument("--price-option", default="PriceAdj=F", help="Wind wsd 行情参数，例如 PriceAdj=F;TradingCalendar=HKEX")
     parser.add_argument("--adjusted", default="F", help="写入 daily_prices.adjusted 的行情口径标识")
+    parser.add_argument("--industry-field", default=DEFAULT_INDUSTRY_FIELD, help="Wind wss 行业字段，默认 wicsname2024")
+    parser.add_argument("--industry-options", default=DEFAULT_INDUSTRY_OPTIONS, help="Wind wss 行业参数，可用 {trade_date} 占位符，默认 tradeDate={trade_date};industryType=1;")
+    parser.add_argument("--industry-system", default=WIND_LEVEL1_INDUSTRY_SYSTEM, help="写入 stock_industry.classification_system 的行业体系标识")
+    parser.add_argument("--force-industry-refresh", action="store_true", help="忽略季度缓存，强制刷新行业映射")
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--date-chunk", choices=["Y", "Q", "ALL"], default="Y")
     parser.add_argument("--check-days", type=int, default=DEFAULT_ADJUST_CHECK_DAYS)
@@ -613,6 +792,19 @@ def main():
             date_chunk=args.date_chunk,
             price_option=args.price_option,
             adjusted=args.adjusted,
+        )
+
+    if args.industries_from_wind:
+        update_industries_from_wind(
+            db_path=args.db_path,
+            universe_name=args.universe_name,
+            sector_id=args.sector_id,
+            end_date=args.end_date,
+            batch_size=args.batch_size,
+            industry_field=args.industry_field,
+            industry_options=args.industry_options,
+            classification_system=args.industry_system,
+            force=args.force_industry_refresh,
         )
 
     if args.smart_adjust_refresh:
