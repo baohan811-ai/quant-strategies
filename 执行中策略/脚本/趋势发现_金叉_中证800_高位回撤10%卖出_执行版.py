@@ -19,8 +19,8 @@ INITIAL_WEIGHT = 1 / MAX_HOLDINGS
 TRANSACTION_COST_RATE = 0.0025
 STOP_DRAWDOWN = 0.2
 PEAK_RETRACE_SELL_DRAWDOWN = 0.1
-LOW_EFFICIENCY_MIN_HOLDING_DAYS = 100
-LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD = 0.03
+LOW_EFFICIENCY_MIN_HOLDING_DAYS = 60
+LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD = 0.05
 LOW_EFFICIENCY_CURRENT_PROFIT_THRESHOLD = 0.00
 
 # 评分系统
@@ -670,16 +670,14 @@ for date in close_df.index:
         current_profit = close_price / entry_price - 1 if entry_price > 0 else np.nan
         is_low_efficiency_holding = (
             holding_days > LOW_EFFICIENCY_MIN_HOLDING_DAYS
-            and (
-                max_profit_after_update <= LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD
-                or current_profit <= LOW_EFFICIENCY_CURRENT_PROFIT_THRESHOLD
-            )
+            and max_profit_after_update <= LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD
+            and current_profit <= LOW_EFFICIENCY_CURRENT_PROFIT_THRESHOLD
         )
 
         if is_low_efficiency_holding:
             low_efficiency_reason = (
                 f"低效持仓卖出：持有超过{LOW_EFFICIENCY_MIN_HOLDING_DAYS}个交易日，"
-                f"历史最高浮盈未超过{LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD:.0%}或当前浮盈不超过"
+                f"历史最高浮盈未超过{LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD:.0%}且当前浮盈不超过"
                 f"{LOW_EFFICIENCY_CURRENT_PROFIT_THRESHOLD:.0%}"
             )
             pending_open_sell_signals[code] = {
