@@ -661,11 +661,12 @@ def update_prices_from_wind(
         print(f"价格口径：{price_option} / adjusted={adjusted}")
         print(f"每批股票数：{batch_size}")
 
+        status_counts = {"success": 0, "skip": 0, "failed": 0}
         for chunk_start, chunk_end in iter_date_chunks(start_date, end_date, date_chunk):
             for field in fields:
                 for batch_start in range(0, len(codes), batch_size):
                     batch_end = min(batch_start + batch_size, len(codes))
-                    fetch_price_batch_from_wind(
+                    status, _ = fetch_price_batch_from_wind(
                         w,
                         conn,
                         dataset,
@@ -678,9 +679,17 @@ def update_prices_from_wind(
                         price_option,
                         adjusted,
                     )
+                    status_counts[status] = status_counts.get(status, 0) + 1
 
         if set(COMPLETE_EOD_PRICE_FIELDS).issubset(set(fields)) and adjusted == "F":
             cleanup_incomplete_eod_rows(conn, start_date, end_date, adjusted=adjusted)
+
+        if status_counts.get("failed", 0) > 0:
+            raise RuntimeError(
+                f"行情更新存在失败批次：success={status_counts.get('success', 0)}, "
+                f"skip={status_counts.get('skip', 0)}, failed={status_counts.get('failed', 0)}。"
+                "请检查上方 Wind 错误信息。"
+            )
     finally:
         conn.close()
         w.close()

@@ -58,6 +58,17 @@ def init_market_db(db_path=MARKET_DB_PATH):
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS universe_constituents_snapshot (
+                snapshot_date TEXT NOT NULL,
+                universe_name TEXT NOT NULL,
+                sector_id TEXT NOT NULL,
+                wind_code TEXT NOT NULL,
+                sec_name TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_date, universe_name, wind_code)
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_industry (
                 classification_system TEXT NOT NULL,
                 wind_code TEXT NOT NULL,
@@ -102,6 +113,10 @@ def init_market_db(db_path=MARKET_DB_PATH):
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_stock_industry_level1
             ON stock_industry (classification_system, industry_level1)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_universe_constituents_snapshot_universe_date
+            ON universe_constituents_snapshot (universe_name, snapshot_date)
         """)
         _set_metadata(conn, "schema_version", "2")
         conn.commit()

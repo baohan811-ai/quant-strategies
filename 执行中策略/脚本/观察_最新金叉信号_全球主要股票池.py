@@ -260,6 +260,7 @@ def get_wsq_last_batch(codes, trade_date, batch_size=1000):
 
 
 def get_close_df_with_cache(universe, codes, start_date, end_date, realtime_date):
+    require_complete_eod = universe.get("require_complete_eod", True)
     if universe.get("use_local_db"):
         close_df = load_price_matrix(
             universe["cache_prefix"],
@@ -269,7 +270,7 @@ def get_close_df_with_cache(universe, codes, start_date, end_date, realtime_date
             end_date=end_date,
             prefer_sqlite=True,
             fallback_pickle=False,
-            require_complete_eod=universe.get("require_complete_eod", True),
+            require_complete_eod=require_complete_eod,
             adjusted=universe.get("adjusted", "F"),
         )
         close_df = sanitize_price_df(close_df)
@@ -279,6 +280,36 @@ def get_close_df_with_cache(universe, codes, start_date, end_date, realtime_date
                 f"{universe['name']} {PRICE_FIELD} 使用本地 SQLite 行情库 "
                 f"adjusted={universe.get('adjusted', 'F')}"
             )
+            min_recent_coverage = max(1, int(len(codes) * 0.95))
+            recent_coverage = close_df.notna().sum(axis=1).tail(RECENT_REFRESH_DAYS)
+            low_coverage_dates = recent_coverage[recent_coverage < min_recent_coverage]
+            if not low_coverage_dates.empty:
+                coverage_start = low_coverage_dates.index[0]
+                print(
+                    f"{universe['name']} 最近行情覆盖不足："
+                    f"{coverage_start.date()} 起最低仅 "
+                    f"{int(low_coverage_dates.min())}/{len(codes)} 只，"
+                    f"从 Wind 补拉 {coverage_start.date()} ~ {end_date}"
+                )
+                coverage_fix_df = get_wsd_batch(
+                    codes,
+                    PRICE_FIELD,
+                    coverage_start.strftime("%Y-%m-%d"),
+                    end_date,
+                    universe["batch_size"],
+                    universe["price_option"],
+                )
+                if not coverage_fix_df.empty:
+                    close_df = close_df.loc[close_df.index < coverage_start]
+                    close_df = pd.concat([close_df, coverage_fix_df], axis=0)
+                    close_df = sanitize_price_df(close_df)
+                    close_df = close_df[~close_df.index.duplicated(keep="last")]
+                    close_df = close_df.loc[:, [code for code in codes if code in close_df.columns]]
+                elif require_complete_eod:
+                    raise RuntimeError(
+                        f"{universe['name']} 最近行情覆盖不足且 Wind 补拉失败；"
+                        "为避免使用残缺行情生成金叉报告，已停止。"
+                    )
             latest_local_date = close_df.dropna(how="all").index.max()
             if pd.notna(latest_local_date) and latest_local_date < pd.Timestamp(end_date):
                 missing_start = latest_local_date + pd.Timedelta(days=1)
@@ -300,6 +331,12 @@ def get_close_df_with_cache(universe, codes, start_date, end_date, realtime_date
                     close_df = sanitize_price_df(close_df)
                     close_df = close_df[~close_df.index.duplicated(keep="last")]
                     close_df = close_df.loc[:, [code for code in codes if code in close_df.columns]]
+                elif require_complete_eod:
+                    raise RuntimeError(
+                        f"{universe['name']} 本地 SQLite 行情截止 {latest_local_date.date()}，"
+                        f"Wind 补拉 {missing_start.date()} ~ {end_date} 失败；"
+                        "为避免使用过期行情生成金叉报告，已停止。"
+                    )
             if realtime_date is not None:
                 rt_df = get_wsq_last_batch(codes, realtime_date)
                 if not rt_df.empty:
@@ -307,6 +344,12 @@ def get_close_df_with_cache(universe, codes, start_date, end_date, realtime_date
                     close_df = sanitize_price_df(close_df)
                     close_df = close_df[~close_df.index.duplicated(keep="last")]
                     close_df = close_df.loc[:, [code for code in codes if code in close_df.columns]]
+            latest_close_date = close_df.dropna(how="all").index.max()
+            if require_complete_eod and pd.notna(latest_close_date) and latest_close_date < pd.Timestamp(end_date):
+                raise RuntimeError(
+                    f"{universe['name']} 行情最新日期为 {latest_close_date.date()}，"
+                    f"小于 EOD 截止 {end_date}；为避免报告日期和数据日期不一致，已停止。"
+                )
             return close_df
         print(f"{universe['name']} 本地 SQLite 行情为空，回退 Wind/pkl 缓存")
 
