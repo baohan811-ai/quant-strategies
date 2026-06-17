@@ -138,6 +138,39 @@ def get_latest_price_date(db_path=MARKET_DB_PATH, adjusted="F"):
     return row[0] if row and row[0] else None
 
 
+def count_complete_price_rows(
+    codes,
+    trade_date,
+    fields=None,
+    db_path=MARKET_DB_PATH,
+    adjusted="F",
+    chunk_size=800,
+):
+    codes = list(codes) if codes is not None else []
+    if not os.path.exists(db_path) or len(codes) == 0:
+        return 0
+
+    fields = fields or COMPLETE_EOD_PRICE_FIELDS
+    complete_conditions = " AND ".join(
+        f"{field} IS NOT NULL" for field in fields
+    )
+    total = 0
+    with sqlite3.connect(db_path) as conn:
+        for start in range(0, len(codes), chunk_size):
+            code_chunk = codes[start:start + chunk_size]
+            placeholders = ",".join("?" for _ in code_chunk)
+            row = conn.execute(f"""
+                SELECT COUNT(DISTINCT wind_code)
+                FROM daily_prices
+                WHERE adjusted = ?
+                  AND trade_date = ?
+                  AND wind_code IN ({placeholders})
+                  AND {complete_conditions}
+            """, (adjusted, trade_date, *code_chunk)).fetchone()
+            total += int(row[0] or 0)
+    return total
+
+
 def get_recent_wind_trading_dates(wind_client, end_date):
     query_end = pd.Timestamp(end_date)
     query_start = query_end - pd.Timedelta(days=30)
@@ -166,6 +199,10 @@ def ensure_market_data_updated(
     sector_id=A_SHARE_SECTOR_ID,
     refresh_days=15,
     price_fields=None,
+    target_codes=None,
+    min_coverage_ratio=0.95,
+    price_option="PriceAdj=F",
+    adjusted="F",
 ):
     recent_trading_dates = get_recent_wind_trading_dates(wind_client, end_date)
     latest_trading_date = recent_trading_dates[-1]
@@ -174,18 +211,44 @@ def ensure_market_data_updated(
         if len(recent_trading_dates) >= 2
         else latest_trading_date
     )
-    latest_price_date = get_latest_price_date(db_path)
-    if latest_price_date is not None and latest_price_date >= latest_complete_target_date:
-        print(f"本地行情数据库已是最新：{latest_price_date}")
-        if latest_price_date < latest_trading_date:
+
+    fields = price_fields or DEFAULT_DAILY_PRICE_FIELDS
+    if target_codes is not None:
+        target_codes = list(target_codes)
+    if target_codes:
+        min_coverage = max(1, int(len(target_codes) * min_coverage_ratio))
+        coverage = count_complete_price_rows(
+            target_codes,
+            latest_complete_target_date,
+            fields=fields,
+            db_path=db_path,
+            adjusted=adjusted,
+        )
+        if coverage >= min_coverage:
+            print(
+                f"本地行情数据库已覆盖 {universe_name} {latest_complete_target_date}: "
+                f"{coverage}/{len(target_codes)}"
+            )
             print(f"最新交易日 {latest_trading_date} 由策略使用 wsq 实时行情临时补齐。")
-        return latest_trading_date
+            return latest_trading_date
+        latest_price_date = None
+        print(
+            f"本地行情数据库覆盖不足：{universe_name} {latest_complete_target_date} "
+            f"{coverage}/{len(target_codes)}，目标至少 {min_coverage}"
+        )
+    else:
+        latest_price_date = get_latest_price_date(db_path, adjusted=adjusted)
+        if latest_price_date is not None and latest_price_date >= latest_complete_target_date:
+            print(f"本地行情数据库已是最新：{latest_price_date}")
+            if latest_price_date < latest_trading_date:
+                print(f"最新交易日 {latest_trading_date} 由策略使用 wsq 实时行情临时补齐。")
+            return latest_trading_date
 
     print(
         "本地行情数据库需要更新："
         f"当前={latest_price_date or '无数据'}，目标={latest_complete_target_date}"
     )
-    if latest_price_date is not None:
+    if latest_price_date is not None and not target_codes:
         update_start_date = (
             pd.Timestamp(latest_price_date) + pd.Timedelta(days=1)
         ).strftime("%Y-%m-%d")
@@ -210,11 +273,35 @@ def ensure_market_data_updated(
         "--start-date",
         update_start_date,
         "--price-fields",
-        *(price_fields or DEFAULT_DAILY_PRICE_FIELDS),
+        *fields,
+        "--price-option",
+        price_option,
+        "--adjusted",
+        adjusted,
     ]
     subprocess.run(cmd, check=True)
 
-    updated_price_date = get_latest_price_date(db_path)
+    if target_codes:
+        updated_coverage = count_complete_price_rows(
+            target_codes,
+            latest_complete_target_date,
+            fields=fields,
+            db_path=db_path,
+            adjusted=adjusted,
+        )
+        if updated_coverage < min_coverage:
+            raise RuntimeError(
+                f"本地行情数据库更新后覆盖仍不足：{universe_name} "
+                f"{latest_complete_target_date} {updated_coverage}/{len(target_codes)}，"
+                "为避免使用残缺行情，已停止。"
+            )
+        print(
+            f"本地行情数据库更新完成：{universe_name} "
+            f"{latest_complete_target_date} {updated_coverage}/{len(target_codes)}"
+        )
+        return latest_trading_date
+
+    updated_price_date = get_latest_price_date(db_path, adjusted=adjusted)
     if updated_price_date is None or updated_price_date < latest_complete_target_date:
         print(
             "本地行情数据库更新后仍未到最新完整交易日，"

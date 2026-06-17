@@ -46,7 +46,7 @@ VOLUME_RATIO_MAX_BONUS_BASE = 1.0
 SIGNAL_MAX_DAILY_RETURN = 0.065
 
 LOOKBACK_DAYS = 1600
-TRADE_START_DATE = "2023-04-03"  # 必须写成字符串，例如 "2025-01-01"；None 表示沿用当前逻辑
+TRADE_START_DATE = "2023-04-01"  # 必须写成字符串，例如 "2025-01-01"；None 表示沿用当前逻辑
 CACHE_PREFIX = "中证800"
 WIND_INDEX_CODE = "000906.SH"
 USE_HISTORICAL_CONSTITUENTS = True
@@ -182,6 +182,10 @@ def get_limit_down_ratio(code, stock_name):
     return get_limit_up_ratio(code, stock_name)
 
 
+def is_delisted_security(code):
+    return "退市" in str(code_to_name.get(code, ""))
+
+
 def sanitize_score_component(df):
     return df.replace([np.inf, -np.inf], np.nan)
 
@@ -265,7 +269,14 @@ if TRADE_START_DATE is not None:
     if trade_start_dt > end_dt.date():
         raise ValueError("TRADE_START_DATE 不能晚于 end_date，请检查参数设置。")
 
-end_date = ensure_market_data_updated(w, end_date)
+end_date = ensure_market_data_updated(
+    w,
+    end_date,
+    universe_name=CACHE_PREFIX,
+    sector_id=sector_id,
+    price_fields=["open", "high", "low", "close", "volume", "amt"],
+    target_codes=stock_codes,
+)
 end_dt = pd.Timestamp(end_date).to_pydatetime()
 
 historical_constituent_snapshots = pd.DataFrame()
@@ -596,6 +607,7 @@ closed_trade_holding_days = []
 latest_trade_date = close_df.index[-1]
 latest_intraday_stop_monitor_records = []
 latest_low_efficiency_sell_plan_records = []
+last_valid_close_date = close_df.apply(lambda series: series.dropna().index.max())
 prev_date = None
 
 for date in close_df.index:
@@ -607,6 +619,30 @@ for date in close_df.index:
         for code in list(current_holdings.keys()):
             prev_price = close_df.at[prev_date, code]
             price = close_df.at[date, code]
+            last_price_date = last_valid_close_date.get(code)
+            if (
+                is_delisted_security(code)
+                and pd.isna(price)
+                and pd.notna(last_price_date)
+                and date > last_price_date
+            ):
+                holding_info = current_holdings[code]
+                entry_price = holding_info["entry_price"]
+                entry_date = holding_info["entry_date"]
+                holding_days = close_df.index.get_loc(date) - close_df.index.get_loc(entry_date)
+                delist_reason = "退市归零"
+                closed_trade_returns.append(-1.0)
+                closed_trade_outcomes.append("loss")
+                closed_trade_reasons.append(delist_reason)
+                closed_trade_holding_days.append(holding_days)
+                stop_signal.at[date, code] = True
+                sell_reason.at[date, code] = delist_reason
+                sell_trigger_price.at[date, code] = 0.0
+                sell_float_pnl.at[date, code] = -1.0 if entry_price > 0 else np.nan
+                sold_today.add(code)
+                del current_holdings[code]
+                pending_open_sell_signals.pop(code, None)
+                continue
             if pd.isna(prev_price) or pd.isna(price) or prev_price <= 0:
                 continue
             current_holdings[code]["value"] *= price / prev_price

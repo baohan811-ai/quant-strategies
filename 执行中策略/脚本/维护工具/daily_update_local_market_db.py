@@ -1,18 +1,71 @@
 import os
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timedelta
+
+from local_market_db import MARKET_DB_PATH
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 LOG_DIR = os.path.join(BASE_DIR, "输出", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
+FULL_ADJUSTED_REFRESH_INTERVAL_DAYS = 7
+FULL_ADJUSTED_REFRESH_START_DATE = "2018-01-01"
+FULL_ADJUSTED_REFRESH_METADATA_KEY = "full_adjusted_refresh:全部A股:last_run_date"
+ADJUST_ANCHOR_CHECK_INTERVAL_DAYS = 7
+ADJUST_ANCHOR_CHECK_METADATA_KEY = "adjust_anchor_check:全部A股:last_run_date"
+ENABLE_FULL_ADJUSTED_REFRESH = os.environ.get("ENABLE_FULL_ADJUSTED_REFRESH") == "1"
+ENABLE_ADJUST_ANCHOR_CHECK = os.environ.get("ENABLE_ADJUST_ANCHOR_CHECK", "1").lower() not in {"0", "false", "no"}
 
 
 def run_step(name, args):
     print(f"\n===== {name} [{datetime.now().isoformat(timespec='seconds')}] =====")
     subprocess.run([sys.executable, *args], cwd=BASE_DIR, check=True)
+
+
+def get_metadata(key):
+    if not os.path.exists(MARKET_DB_PATH):
+        return None
+    with sqlite3.connect(MARKET_DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_metadata(key, value):
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(MARKET_DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO metadata (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+        """, (key, str(value), updated_at))
+        conn.commit()
+
+
+def should_run_full_adjusted_refresh(today):
+    if not ENABLE_FULL_ADJUSTED_REFRESH:
+        return False
+    if os.environ.get("FORCE_FULL_ADJUSTED_REFRESH") == "1":
+        return True
+    last_run_date = get_metadata(FULL_ADJUSTED_REFRESH_METADATA_KEY)
+    if not last_run_date:
+        return True
+    return (today - datetime.strptime(last_run_date, "%Y-%m-%d").date()).days >= FULL_ADJUSTED_REFRESH_INTERVAL_DAYS
+
+
+def should_run_adjust_anchor_check(today):
+    if not ENABLE_ADJUST_ANCHOR_CHECK:
+        return False
+    if os.environ.get("FORCE_ADJUST_ANCHOR_CHECK") == "1":
+        return True
+    last_run_date = get_metadata(ADJUST_ANCHOR_CHECK_METADATA_KEY)
+    if not last_run_date:
+        return True
+    return (today - datetime.strptime(last_run_date, "%Y-%m-%d").date()).days >= ADJUST_ANCHOR_CHECK_INTERVAL_DAYS
 
 
 def main():
@@ -30,6 +83,29 @@ def main():
         "--batch-size", "500",
         "--date-chunk", "ALL",
     ])
+    print(
+        "\n===== 除权除息事件驱动回刷：已停用，跳过 "
+        f"[{datetime.now().isoformat(timespec='seconds')}] ====="
+    )
+    today = datetime.today().date()
+    if should_run_full_adjusted_refresh(today):
+        run_step("全量回刷全部A股前复权价格", [
+            update_script,
+            "--prices-from-wind",
+            "--force-price-refresh",
+            "--universe-name", "全部A股",
+            "--start-date", FULL_ADJUSTED_REFRESH_START_DATE,
+            "--end-date", eod_end_date,
+            "--price-fields", "open", "high", "low", "close",
+            "--batch-size", "500",
+            "--date-chunk", "Y",
+        ])
+        set_metadata(FULL_ADJUSTED_REFRESH_METADATA_KEY, today.strftime("%Y-%m-%d"))
+    else:
+        print(
+            "\n===== 全量回刷全部A股前复权价格：未到周期，跳过 "
+            f"[{datetime.now().isoformat(timespec='seconds')}] ====="
+        )
     run_step("更新最近港股行情", [
         update_script,
         "--prices-from-wind",
@@ -37,7 +113,7 @@ def main():
         "--sector-id", "a002010100000000",
         "--end-date", eod_end_date,
         "--refresh-days", "5",
-        "--price-fields", "close",
+        "--price-fields", "close", "volume",
         "--price-option", "PriceAdj=F;TradingCalendar=HKEX",
         "--adjusted", "F_HKEX",
         "--batch-size", "500",
@@ -50,7 +126,7 @@ def main():
         "--sector-id", "a005010800000000",
         "--end-date", eod_end_date,
         "--refresh-days", "5",
-        "--price-fields", "close",
+        "--price-fields", "close", "volume",
         "--price-option", "PriceAdj=F;TradingCalendar=NYSE",
         "--adjusted", "F_NYSE",
         "--batch-size", "500",
@@ -63,7 +139,7 @@ def main():
         "--sector-id", "1000009964000000",
         "--end-date", eod_end_date,
         "--refresh-days", "5",
-        "--price-fields", "close",
+        "--price-fields", "close", "volume",
         "--price-option", "PriceAdj=F;TradingCalendar=NYSE",
         "--adjusted", "F_NYSE",
         "--batch-size", "500",
@@ -96,18 +172,27 @@ def main():
         "--sector-id", "1000009964000000",
         "--batch-size", "500",
     ])
-    run_step("智能复权校验", [
-        update_script,
-        "--smart-adjust-refresh",
-        "--universe-name", "全部A股",
-        "--end-date", eod_end_date,
-        "--adjust-history-start-date", "2022-01-01",
-        "--price-fields", "open", "high", "low", "close", "volume", "amt",
-        "--check-days", "5",
-        "--adjust-tolerance", "0.0001",
-        "--batch-size", "500",
-        "--date-chunk", "Y",
-    ])
+    if should_run_adjust_anchor_check(today):
+        run_step("前复权锚点一致性校验", [
+            update_script,
+            "--smart-adjust-refresh",
+            "--universe-name", "全部A股",
+            "--end-date", eod_end_date,
+            "--adjust-history-start-date", FULL_ADJUSTED_REFRESH_START_DATE,
+            "--price-fields", "open", "high", "low", "close",
+            "--check-days", "5",
+            "--adjust-tolerance", "0.0001",
+            "--deep-adjust-check",
+            "--adjust-check-frequency", "Q",
+            "--batch-size", "500",
+            "--date-chunk", "Y",
+        ])
+        set_metadata(ADJUST_ANCHOR_CHECK_METADATA_KEY, today.strftime("%Y-%m-%d"))
+    else:
+        print(
+            "\n===== 前复权锚点一致性校验：未到周期或已关闭，跳过 "
+            f"[{datetime.now().isoformat(timespec='seconds')}] ====="
+        )
     run_step("更新基础基本面", [
         update_script,
         "--fundamentals",

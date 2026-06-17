@@ -1,13 +1,20 @@
 from WindPy import w
 import os
 import subprocess
+import sqlite3
+import sys
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from html import escape
 from zoneinfo import ZoneInfo
 
-from 维护工具.local_market_db import load_price_matrix, load_stock_industry_map
+from 维护工具.local_market_db import (
+    MARKET_DB_PATH,
+    COMPLETE_EOD_PRICE_FIELDS,
+    load_price_matrix,
+    load_stock_industry_map,
+)
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,11 +32,33 @@ RECENT_REFRESH_DAYS = 10
 MA_FAST = 5
 MA_SLOW = 60
 PRICE_FIELD = "close"
+VOLUME_FIELD = "volume"
 PRICE_ADJ_OPTION = "PriceAdj=F"
 USE_REALTIME_SUPPLEMENT = True
 AUTO_PUBLISH_PAGES = os.environ.get("AUTO_PUBLISH_PAGES", "1").lower() not in {"0", "false", "no"}
+AUTO_UPDATE_LOCAL_DB = os.environ.get("AUTO_UPDATE_LOCAL_DB", "1").lower() not in {"0", "false", "no"}
 HEAT_LOOKBACK_DAYS = 30
-OUTPUT_SIGNAL_COLUMNS = ["市场", "信号日期", "代码", "名称", "万得一级行业", "最新收盘"]
+# 最新观察只补最近数据；复权一致性由 update_local_market_db.py 抽查边界 close，
+# 发现漂移后再回刷异常股票历史。
+ADJUSTED_PRICE_REFRESH_DAYS = RECENT_REFRESH_DAYS
+MA5_MA60_GAP_WEIGHT = 1.0
+MA60_5D_TREND_WEIGHT = 1.0
+VOLUME_RATIO_SCORE_WEIGHT = 0.25
+VOLUME_RATIO_LOOKBACK = 20
+VOLUME_RATIO_MAX_BONUS_BASE = 1.0
+OUTPUT_SIGNAL_COLUMNS = [
+    "市场",
+    "信号日期",
+    "代码",
+    "名称",
+    "万得一级行业",
+    "最新收盘",
+    "评分",
+    "MA5相对MA60强度",
+    "MA60近5日趋势分",
+    "量比",
+    "量比加分",
+]
 HTML_HIDDEN_COLUMNS = {"市场", "信号日期"}
 UNIVERSES = [
     {
@@ -259,12 +288,119 @@ def get_wsq_last_batch(codes, trade_date, batch_size=1000):
     return sanitize_price_df(df)
 
 
-def get_close_df_with_cache(universe, codes, start_date, end_date, realtime_date):
+def chunked(items, size):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def get_required_db_fields(universe):
+    if universe.get("require_complete_eod", True):
+        return list(COMPLETE_EOD_PRICE_FIELDS)
+    return [PRICE_FIELD, VOLUME_FIELD]
+
+
+def count_complete_price_rows(db_path, codes, trade_date, adjusted, fields):
+    if not os.path.exists(db_path) or not codes:
+        return 0
+
+    field_conditions = " AND ".join(f"{field} IS NOT NULL" for field in fields)
+    total = 0
+    with sqlite3.connect(db_path) as conn:
+        for code_chunk in chunked(list(codes), 800):
+            placeholders = ",".join("?" for _ in code_chunk)
+            query = f"""
+                SELECT COUNT(DISTINCT wind_code)
+                FROM daily_prices
+                WHERE adjusted = ?
+                  AND trade_date = ?
+                  AND wind_code IN ({placeholders})
+                  AND {field_conditions}
+            """
+            row = conn.execute(query, [adjusted, trade_date, *code_chunk]).fetchone()
+            total += int(row[0] or 0)
+    return total
+
+
+def ensure_universe_local_db_updated(universe, codes, eod_end_date):
+    if not universe.get("use_local_db"):
+        return
+
+    min_coverage = max(1, int(len(codes) * 0.95))
+    adjusted = universe.get("adjusted", "F")
+    required_fields = get_required_db_fields(universe)
+    coverage = count_complete_price_rows(
+        MARKET_DB_PATH,
+        codes,
+        eod_end_date,
+        adjusted,
+        required_fields,
+    )
+    if coverage >= min_coverage:
+        print(
+            f"{universe['name']} 本地行情库已覆盖 {eod_end_date}: "
+            f"{coverage}/{len(codes)}"
+        )
+        return
+
+    if not AUTO_UPDATE_LOCAL_DB:
+        print(
+            f"{universe['name']} 本地行情库未覆盖 {eod_end_date}: "
+            f"{coverage}/{len(codes)}；AUTO_UPDATE_LOCAL_DB=0，跳过自动补数据。"
+        )
+        return
+
+    refresh_days = max(ADJUSTED_PRICE_REFRESH_DAYS, RECENT_REFRESH_DAYS)
+    update_script = os.path.join(SCRIPT_DIR, "维护工具", "update_local_market_db.py")
+    cmd = [
+        update_script,
+        "--prices-from-wind",
+        "--universe-name", universe["name"],
+        "--sector-id", universe["sector_id"],
+        "--end-date", eod_end_date,
+        "--refresh-days", str(refresh_days),
+        "--price-fields", *required_fields,
+        "--price-option", universe["price_option"],
+        "--adjusted", adjusted,
+        "--batch-size", str(universe["batch_size"]),
+        "--date-chunk", "ALL",
+    ]
+    if adjusted == "F":
+        cmd.extend([
+            "--repair-adjust-drift",
+            "--adjust-history-start-date", "2018-01-01",
+        ])
+    print(
+        f"{universe['name']} 本地行情库未到最新或覆盖不足："
+        f"{eod_end_date} 仅 {coverage}/{len(codes)}，先更新本地库"
+    )
+    run_cmd = [sys.executable, *cmd]
+    subprocess.run(run_cmd, cwd=BASE_DIR, check=True)
+
+    coverage_after = count_complete_price_rows(
+        MARKET_DB_PATH,
+        codes,
+        eod_end_date,
+        adjusted,
+        required_fields,
+    )
+    if coverage_after < min_coverage:
+        raise RuntimeError(
+            f"{universe['name']} 本地行情库更新后覆盖仍不足："
+            f"{eod_end_date} {coverage_after}/{len(codes)}，"
+            "为避免使用残缺行情生成金叉报告，已停止。"
+        )
+    print(
+        f"{universe['name']} 本地行情库更新完成："
+        f"{eod_end_date} {coverage_after}/{len(codes)}"
+    )
+
+
+def get_price_df_with_cache(universe, codes, field, start_date, end_date, realtime_date=None):
     require_complete_eod = universe.get("require_complete_eod", True)
     if universe.get("use_local_db"):
-        close_df = load_price_matrix(
+        price_df = load_price_matrix(
             universe["cache_prefix"],
-            PRICE_FIELD,
+            field,
             codes=codes,
             start_date=start_date,
             end_date=end_date,
@@ -273,150 +409,184 @@ def get_close_df_with_cache(universe, codes, start_date, end_date, realtime_date
             require_complete_eod=require_complete_eod,
             adjusted=universe.get("adjusted", "F"),
         )
-        close_df = sanitize_price_df(close_df)
-        close_df = close_df.loc[:, [code for code in codes if code in close_df.columns]]
-        if not close_df.empty and close_df.notna().sum().sum() > 0:
+        price_df = sanitize_price_df(price_df)
+        price_df = price_df.loc[:, [code for code in codes if code in price_df.columns]]
+        if not price_df.empty and price_df.notna().sum().sum() > 0:
             print(
-                f"{universe['name']} {PRICE_FIELD} 使用本地 SQLite 行情库 "
+                f"{universe['name']} {field} 使用本地 SQLite 行情库 "
                 f"adjusted={universe.get('adjusted', 'F')}"
             )
             min_recent_coverage = max(1, int(len(codes) * 0.95))
-            recent_coverage = close_df.notna().sum(axis=1).tail(RECENT_REFRESH_DAYS)
+            recent_coverage = price_df.notna().sum(axis=1).tail(RECENT_REFRESH_DAYS)
             low_coverage_dates = recent_coverage[recent_coverage < min_recent_coverage]
             if not low_coverage_dates.empty:
                 coverage_start = low_coverage_dates.index[0]
                 print(
-                    f"{universe['name']} 最近行情覆盖不足："
+                    f"{universe['name']} 最近 {field} 覆盖不足："
                     f"{coverage_start.date()} 起最低仅 "
                     f"{int(low_coverage_dates.min())}/{len(codes)} 只，"
                     f"从 Wind 补拉 {coverage_start.date()} ~ {end_date}"
                 )
                 coverage_fix_df = get_wsd_batch(
                     codes,
-                    PRICE_FIELD,
+                    field,
                     coverage_start.strftime("%Y-%m-%d"),
                     end_date,
                     universe["batch_size"],
                     universe["price_option"],
                 )
                 if not coverage_fix_df.empty:
-                    close_df = close_df.loc[close_df.index < coverage_start]
-                    close_df = pd.concat([close_df, coverage_fix_df], axis=0)
-                    close_df = sanitize_price_df(close_df)
-                    close_df = close_df[~close_df.index.duplicated(keep="last")]
-                    close_df = close_df.loc[:, [code for code in codes if code in close_df.columns]]
+                    price_df = price_df.loc[price_df.index < coverage_start]
+                    price_df = pd.concat([price_df, coverage_fix_df], axis=0)
+                    price_df = sanitize_price_df(price_df)
+                    price_df = price_df[~price_df.index.duplicated(keep="last")]
+                    price_df = price_df.loc[:, [code for code in codes if code in price_df.columns]]
                 elif require_complete_eod:
                     raise RuntimeError(
-                        f"{universe['name']} 最近行情覆盖不足且 Wind 补拉失败；"
+                        f"{universe['name']} 最近 {field} 覆盖不足且 Wind 补拉失败；"
                         "为避免使用残缺行情生成金叉报告，已停止。"
                     )
-            latest_local_date = close_df.dropna(how="all").index.max()
+            latest_local_date = price_df.dropna(how="all").index.max()
             if pd.notna(latest_local_date) and latest_local_date < pd.Timestamp(end_date):
                 missing_start = latest_local_date + pd.Timedelta(days=1)
+                if field == PRICE_FIELD:
+                    refresh_start = latest_local_date - pd.Timedelta(days=ADJUSTED_PRICE_REFRESH_DAYS - 1)
+                    missing_start = max(refresh_start, pd.Timestamp(start_date))
                 print(
-                    f"{universe['name']} 本地 SQLite 行情截止 {latest_local_date.date()}，"
+                    f"{universe['name']} 本地 SQLite {field} 截止 {latest_local_date.date()}，"
                     f"从 Wind 补拉 {missing_start.date()} ~ {end_date}"
                 )
                 missing_df = get_wsd_batch(
                     codes,
-                    PRICE_FIELD,
+                    field,
                     missing_start.strftime("%Y-%m-%d"),
                     end_date,
                     universe["batch_size"],
                     universe["price_option"],
                 )
                 if not missing_df.empty:
-                    close_df = close_df.loc[close_df.index < missing_start]
-                    close_df = pd.concat([close_df, missing_df], axis=0)
-                    close_df = sanitize_price_df(close_df)
-                    close_df = close_df[~close_df.index.duplicated(keep="last")]
-                    close_df = close_df.loc[:, [code for code in codes if code in close_df.columns]]
+                    price_df = price_df.loc[price_df.index < missing_start]
+                    price_df = pd.concat([price_df, missing_df], axis=0)
+                    price_df = sanitize_price_df(price_df)
+                    price_df = price_df[~price_df.index.duplicated(keep="last")]
+                    price_df = price_df.loc[:, [code for code in codes if code in price_df.columns]]
                 elif require_complete_eod:
                     raise RuntimeError(
-                        f"{universe['name']} 本地 SQLite 行情截止 {latest_local_date.date()}，"
+                        f"{universe['name']} 本地 SQLite {field} 截止 {latest_local_date.date()}，"
                         f"Wind 补拉 {missing_start.date()} ~ {end_date} 失败；"
                         "为避免使用过期行情生成金叉报告，已停止。"
                     )
-            if realtime_date is not None:
+            if realtime_date is not None and field == PRICE_FIELD:
                 rt_df = get_wsq_last_batch(codes, realtime_date)
                 if not rt_df.empty:
-                    close_df = pd.concat([close_df, rt_df], axis=0)
-                    close_df = sanitize_price_df(close_df)
-                    close_df = close_df[~close_df.index.duplicated(keep="last")]
-                    close_df = close_df.loc[:, [code for code in codes if code in close_df.columns]]
-            latest_close_date = close_df.dropna(how="all").index.max()
-            if require_complete_eod and pd.notna(latest_close_date) and latest_close_date < pd.Timestamp(end_date):
+                    price_df = pd.concat([price_df, rt_df], axis=0)
+                    price_df = sanitize_price_df(price_df)
+                    price_df = price_df[~price_df.index.duplicated(keep="last")]
+                    price_df = price_df.loc[:, [code for code in codes if code in price_df.columns]]
+            latest_price_date = price_df.dropna(how="all").index.max()
+            if require_complete_eod and pd.notna(latest_price_date) and latest_price_date < pd.Timestamp(end_date):
                 raise RuntimeError(
-                    f"{universe['name']} 行情最新日期为 {latest_close_date.date()}，"
+                    f"{universe['name']} {field} 最新日期为 {latest_price_date.date()}，"
                     f"小于 EOD 截止 {end_date}；为避免报告日期和数据日期不一致，已停止。"
                 )
-            return close_df
-        print(f"{universe['name']} 本地 SQLite 行情为空，回退 Wind/pkl 缓存")
+            return price_df
+        print(f"{universe['name']} 本地 SQLite {field} 为空，回退 Wind/pkl 缓存")
 
     cache_prefix = universe["cache_prefix"]
     batch_size = universe["batch_size"]
     price_option = universe["price_option"]
-    cached_df = load_cached_df(cache_prefix, PRICE_FIELD)
+    cached_df = load_cached_df(cache_prefix, field)
 
     if cached_df.empty:
-        print(f"{universe['name']} {PRICE_FIELD} 未命中缓存，开始拉取")
-        close_df = get_wsd_batch(codes, PRICE_FIELD, start_date, end_date, batch_size, price_option)
+        print(f"{universe['name']} {field} 未命中缓存，开始拉取")
+        price_df = get_wsd_batch(codes, field, start_date, end_date, batch_size, price_option)
     else:
         cached_df = cached_df.loc[:, [code for code in cached_df.columns if code in codes]]
         cached_codes = set(cached_df.columns)
         missing_codes = [code for code in codes if code not in cached_codes]
 
-        close_df = cached_df
+        price_df = cached_df
         latest_cached_date = cached_df.index.max().date()
-        refresh_start = latest_cached_date - timedelta(days=RECENT_REFRESH_DAYS - 1)
+        refresh_days = ADJUSTED_PRICE_REFRESH_DAYS if field == PRICE_FIELD else RECENT_REFRESH_DAYS
+        refresh_start = latest_cached_date - timedelta(days=refresh_days - 1)
         update_start = max(refresh_start, pd.Timestamp(start_date).date())
         if update_start <= pd.Timestamp(end_date).date():
-            print(f"{universe['name']} {PRICE_FIELD} 命中缓存，增量更新: {update_start} ~ {end_date}")
+            print(f"{universe['name']} {field} 命中缓存，增量更新: {update_start} ~ {end_date}")
             inc_df = get_wsd_batch(
                 list(cached_df.columns),
-                PRICE_FIELD,
+                field,
                 update_start.strftime("%Y-%m-%d"),
                 end_date,
                 batch_size,
                 price_option,
             )
             if not inc_df.empty:
-                close_df = close_df.loc[close_df.index < pd.Timestamp(update_start)]
-                close_df = pd.concat([close_df, inc_df], axis=0)
+                price_df = price_df.loc[price_df.index < pd.Timestamp(update_start)]
+                price_df = pd.concat([price_df, inc_df], axis=0)
 
         if missing_codes:
-            print(f"{universe['name']} 新增股票 {len(missing_codes)} 只，补拉观察窗口")
+            print(f"{universe['name']} 新增股票 {len(missing_codes)} 只，补拉 {field} 观察窗口")
             missing_df = get_wsd_batch(
                 missing_codes,
-                PRICE_FIELD,
+                field,
                 start_date,
                 end_date,
                 batch_size,
                 price_option,
             )
             if not missing_df.empty:
-                close_df = pd.concat([close_df, missing_df], axis=1)
+                price_df = pd.concat([price_df, missing_df], axis=1)
 
-    if close_df.empty:
-        raise ValueError(f"{universe['name']} close 数据为空，无法计算金叉。")
+    if price_df.empty:
+        raise ValueError(f"{universe['name']} {field} 数据为空，无法计算金叉。")
 
-    close_df = sanitize_price_df(close_df)
-    close_df = close_df[~close_df.index.duplicated(keep="last")]
-    close_df = close_df.loc[:, [code for code in codes if code in close_df.columns]]
+    price_df = sanitize_price_df(price_df)
+    price_df = price_df[~price_df.index.duplicated(keep="last")]
+    price_df = price_df.loc[:, [code for code in codes if code in price_df.columns]]
 
-    if realtime_date is not None:
+    if realtime_date is not None and field == PRICE_FIELD:
         rt_df = get_wsq_last_batch(codes, realtime_date)
         if not rt_df.empty:
-            close_df = pd.concat([close_df, rt_df], axis=0)
-            close_df = sanitize_price_df(close_df)
-            close_df = close_df[~close_df.index.duplicated(keep="last")]
-            close_df = close_df.loc[:, [code for code in codes if code in close_df.columns]]
+            price_df = pd.concat([price_df, rt_df], axis=0)
+            price_df = sanitize_price_df(price_df)
+            price_df = price_df[~price_df.index.duplicated(keep="last")]
+            price_df = price_df.loc[:, [code for code in codes if code in price_df.columns]]
 
-    save_cached_df(cache_prefix, PRICE_FIELD, close_df)
-    return close_df
+    save_cached_df(cache_prefix, field, price_df)
+    return price_df
 
 
-def build_latest_golden_cross_df(universe_name, close_df, code_to_name, code_to_industry=None):
+def get_close_df_with_cache(universe, codes, start_date, end_date, realtime_date):
+    return get_price_df_with_cache(universe, codes, PRICE_FIELD, start_date, end_date, realtime_date)
+
+
+def get_volume_df_with_cache(universe, codes, start_date, end_date):
+    return get_price_df_with_cache(universe, codes, VOLUME_FIELD, start_date, end_date)
+
+
+def sanitize_score_component(df):
+    return df.replace([np.inf, -np.inf], np.nan)
+
+
+def calculate_golden_cross_score_details(ma_fast_df, ma_slow_df, volume_df):
+    ma_fast_slow_gap_score = MA5_MA60_GAP_WEIGHT * (ma_fast_df / ma_slow_df - 1)
+    ma_slow_5d_trend_score = MA60_5D_TREND_WEIGHT * (ma_slow_df / ma_slow_df.shift(5) - 1)
+    volume_ma = volume_df.rolling(VOLUME_RATIO_LOOKBACK).mean()
+    volume_ratio = volume_df / volume_ma.replace(0, np.nan)
+    volume_ratio_score = VOLUME_RATIO_SCORE_WEIGHT * (
+        (volume_ratio - 1).clip(lower=0, upper=VOLUME_RATIO_MAX_BONUS_BASE)
+    )
+    total_score = ma_fast_slow_gap_score + ma_slow_5d_trend_score + volume_ratio_score
+    return {
+        "ma_fast_slow_gap_score": sanitize_score_component(ma_fast_slow_gap_score),
+        "ma_slow_5d_trend_score": sanitize_score_component(ma_slow_5d_trend_score),
+        "volume_ratio": sanitize_score_component(volume_ratio),
+        "volume_ratio_score": sanitize_score_component(volume_ratio_score),
+        "total_score": sanitize_score_component(total_score),
+    }
+
+
+def build_latest_golden_cross_df(universe_name, close_df, volume_df, code_to_name, code_to_industry=None):
     code_to_industry = code_to_industry or {}
     ma_fast = close_df.rolling(MA_FAST).mean()
     ma_slow = close_df.rolling(MA_SLOW).mean()
@@ -428,6 +598,13 @@ def build_latest_golden_cross_df(universe_name, close_df, code_to_name, code_to_
     prev_date = close_df.index[-2] if len(close_df.index) >= 2 else pd.NaT
     signal_series = cross.loc[latest_date].fillna(False)
     signal_codes = signal_series[signal_series].index.tolist()
+    volume_df = volume_df.reindex(index=close_df.index, columns=close_df.columns)
+    score_details = calculate_golden_cross_score_details(ma_fast, ma_slow, volume_df)
+    total_score = score_details["total_score"]
+    ma_fast_slow_gap_score = score_details["ma_fast_slow_gap_score"]
+    ma_slow_5d_trend_score = score_details["ma_slow_5d_trend_score"]
+    volume_ratio = score_details["volume_ratio"]
+    volume_ratio_score = score_details["volume_ratio_score"]
 
     df = pd.DataFrame({
         "市场": universe_name,
@@ -437,6 +614,11 @@ def build_latest_golden_cross_df(universe_name, close_df, code_to_name, code_to_
         "万得一级行业": [code_to_industry.get(code, "") for code in signal_codes],
         "价格口径": PRICE_ADJ_OPTION,
         "最新收盘": [close_df.at[latest_date, code] for code in signal_codes],
+        "评分": [total_score.at[latest_date, code] for code in signal_codes],
+        "MA5相对MA60强度": [ma_fast_slow_gap_score.at[latest_date, code] for code in signal_codes],
+        "MA60近5日趋势分": [ma_slow_5d_trend_score.at[latest_date, code] for code in signal_codes],
+        "量比": [volume_ratio.at[latest_date, code] for code in signal_codes],
+        "量比加分": [volume_ratio_score.at[latest_date, code] for code in signal_codes],
         f"MA{MA_FAST}": [ma_fast.at[latest_date, code] for code in signal_codes],
         f"MA{MA_SLOW}": [ma_slow.at[latest_date, code] for code in signal_codes],
         "当前差值": [spread.at[latest_date, code] for code in signal_codes],
@@ -447,8 +629,8 @@ def build_latest_golden_cross_df(universe_name, close_df, code_to_name, code_to_
         df["_行业排序"] = df["万得一级行业"].replace("", "未分类")
         df = (
             df.sort_values(
-                by=["_行业排序", "当前差值"],
-                ascending=[True, False],
+                by=["评分", "_行业排序", "当前差值"],
+                ascending=[False, True, False],
                 na_position="last",
             )
             .drop(columns="_行业排序")
@@ -487,8 +669,16 @@ def format_html_value(value, column_name=None):
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d")
     if isinstance(value, float):
-        if column_name and ("差值" in column_name):
+        if column_name and (
+            "差值" in column_name
+            or "评分" in column_name
+            or "强度" in column_name
+            or "趋势分" in column_name
+            or "量比加分" in column_name
+        ):
             return f"{value:.4f}"
+        if column_name and "量比" in column_name:
+            return f"{value:.2f}"
         return f"{value:.2f}"
     if isinstance(value, (np.integer, int)):
         return f"{int(value)}"
@@ -1102,6 +1292,7 @@ def main():
             print(f"{universe['name']} 股票数量：{len(codes)}")
             if universe["name"] == "全部A股":
                 print(f"{universe['name']} 本地万得一级行业覆盖：{sum(bool(code_to_industry.get(code)) for code in codes)}")
+            ensure_universe_local_db_updated(universe, codes, eod_end_date)
             close_df = get_close_df_with_cache(
                 universe,
                 codes,
@@ -1109,9 +1300,16 @@ def main():
                 eod_end_date,
                 realtime_date,
             )
+            volume_df = get_volume_df_with_cache(
+                universe,
+                codes,
+                market_start_date,
+                eod_end_date,
+            )
             signal_df, latest_date = build_latest_golden_cross_df(
                 universe["name"],
                 close_df,
+                volume_df,
                 code_to_name,
                 code_to_industry,
             )

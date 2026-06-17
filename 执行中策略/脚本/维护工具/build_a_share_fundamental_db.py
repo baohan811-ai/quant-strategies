@@ -21,6 +21,7 @@ WIND_WEEKLY_CELL_LIMIT = 5000000
 WIND_WEEKLY_STRATEGY_RESERVE = 1500000
 DEFAULT_WIND_CELL_BUDGET = 300000
 WIND_QUOTA_ERROR_CODES = {-40521007, -40522017}
+DEFAULT_EMPTY_CONFIRM_RETRIES = 2
 
 FUNDAMENTAL_FIELDS = {
     "pe_ttm": "pe_ttm",
@@ -89,7 +90,20 @@ class WindCellBudget:
 
 
 def should_retry_quota_failed_batches():
-    return get_bool_env("WIND_RETRY_QUOTA_FAILED", default=False)
+    value = os.environ.get("WIND_RETRY_QUOTA_FAILED")
+    if value is not None:
+        return get_bool_env("WIND_RETRY_QUOTA_FAILED", default=False)
+    return os.environ.get("WIND_CELL_BUDGET") is not None
+
+
+def get_empty_confirm_retries():
+    value = os.environ.get("WIND_EMPTY_CONFIRM_RETRIES")
+    if value is None:
+        return DEFAULT_EMPTY_CONFIRM_RETRIES
+    try:
+        return max(1, int(value))
+    except ValueError:
+        raise ValueError(f"WIND_EMPTY_CONFIRM_RETRIES 必须是整数，当前值: {value}")
 
 
 def normalize_date(value):
@@ -377,10 +391,40 @@ def should_skip_quota_failed_batch(status, error_code, label):
     ):
         print(
             f"跳过 {label}: 上次 Wind 限额/权限失败 ErrorCode={error_code}，"
-            "如需重试请设置 WIND_RETRY_QUOTA_FAILED=1"
+            "如需重试请设置 WIND_RETRY_QUOTA_FAILED=1 或显式设置 WIND_CELL_BUDGET"
         )
         return True
     return False
+
+
+def should_skip_confirmed_empty_batch(status, label):
+    if status == "confirmed_empty":
+        print(f"跳过 {label}: 已确认整批为空，不再重复请求 Wind")
+        return True
+    return False
+
+
+def save_empty_or_confirmed_status(conn, trade_date, field_key, batch_start, batch_end):
+    status, _, _ = batch_status(conn, trade_date, field_key, batch_start, batch_end)
+    if status == "empty" or get_empty_confirm_retries() <= 1:
+        next_status = "confirmed_empty"
+        message = "Wind 请求连续返回整批空值，已确认无数据，后续不再重试"
+    else:
+        next_status = "empty"
+        message = "Wind 请求成功但整批返回空值，等待下次确认"
+
+    save_batch_status(
+        conn,
+        trade_date,
+        field_key,
+        batch_start,
+        batch_end,
+        next_status,
+        0,
+        0,
+        message,
+    )
+    return next_status
 
 
 def parse_single_field_snapshot(data, trade_date, field_key):
@@ -475,6 +519,8 @@ def fetch_one_batch(conn, codes, trade_date, field_key, wind_field, batch_start,
     label = f"{field_key} {trade_date} 股票 {batch_start}-{batch_end}"
     if should_skip_quota_failed_batch(status, error_code, label):
         return "quota_failed_skip", 0
+    if should_skip_confirmed_empty_batch(status, label):
+        return "confirmed_empty_skip", 0
     if status == "success" and non_null_count > 0:
         return "skip", 0
 
@@ -508,20 +554,13 @@ def fetch_one_batch(conn, codes, trade_date, field_key, wind_field, batch_start,
 
     non_null_count = int(df[field_key].notna().sum())
     if non_null_count == 0:
-        print(f"空结果: {field_key} {trade_date} {batch_start}-{batch_end}，保留为待重试")
-        save_batch_status(
-            conn,
-            trade_date,
-            field_key,
-            batch_start,
-            batch_end,
-            "empty",
-            0,
-            0,
-            "Wind 请求成功但整批返回空值",
-        )
+        next_status = save_empty_or_confirmed_status(conn, trade_date, field_key, batch_start, batch_end)
         conn.commit()
-        return "empty", 0
+        if next_status == "confirmed_empty":
+            print(f"空结果: {field_key} {trade_date} {batch_start}-{batch_end}，已确认为空，后续不再重试")
+        else:
+            print(f"空结果: {field_key} {trade_date} {batch_start}-{batch_end}，等待下次确认")
+        return next_status, 0
 
     upsert_fundamental_field(conn, df, field_key)
     save_batch_status(
@@ -620,6 +659,8 @@ def fetch_daily_valuation_field_batch(conn, codes, field_key, wind_field, query_
     label = f"{DAILY_VALUATION_BATCH_KEY} {field_key} {date_range} 股票 {batch_start}-{batch_end}"
     if should_skip_quota_failed_batch(status, error_code, label):
         return "quota_failed_skip", 0
+    if should_skip_confirmed_empty_batch(status, label):
+        return "confirmed_empty_skip", 0
     if status == "success":
         return "skip", 0
 
@@ -656,23 +697,25 @@ def fetch_daily_valuation_field_batch(conn, codes, field_key, wind_field, query_
 
     non_null_count = upsert_daily_valuation_field(conn, df, field_key)
     if non_null_count == 0:
-        print(
-            f"空结果: {DAILY_VALUATION_BATCH_KEY} {field_key} {date_range} "
-            f"{batch_start}-{batch_end}，保留为待重试"
-        )
-        save_batch_status(
+        next_status = save_empty_or_confirmed_status(
             conn,
             date_range,
             batch_field_key,
             batch_start,
             batch_end,
-            "empty",
-            0,
-            0,
-            "Wind 请求成功但整批返回空值",
         )
         conn.commit()
-        return "empty", 0
+        if next_status == "confirmed_empty":
+            print(
+                f"空结果: {DAILY_VALUATION_BATCH_KEY} {field_key} {date_range} "
+                f"{batch_start}-{batch_end}，已确认为空，后续不再重试"
+            )
+        else:
+            print(
+                f"空结果: {DAILY_VALUATION_BATCH_KEY} {field_key} {date_range} "
+                f"{batch_start}-{batch_end}，等待下次确认"
+            )
+        return next_status, 0
 
     save_batch_status(
         conn,
@@ -778,6 +821,8 @@ def fetch_report_batch(conn, codes, rpt_date, batch_start, batch_end, trading_da
     label = f"{QFA_REPORT_BATCH_KEY} {rpt_date} 股票 {batch_start}-{batch_end}"
     if should_skip_quota_failed_batch(status, error_code, label):
         return "quota_failed_skip", 0
+    if should_skip_confirmed_empty_batch(status, label):
+        return "confirmed_empty_skip", 0
     if status == "success" and non_null_count > 0:
         return "skip", 0
 
@@ -820,20 +865,19 @@ def fetch_report_batch(conn, codes, rpt_date, batch_start, batch_end, trading_da
 
     non_null_count = int(df[list(QFA_REPORT_FIELDS)].notna().any(axis=1).sum())
     if non_null_count == 0:
-        print(f"空结果: {QFA_REPORT_BATCH_KEY} {rpt_date} {batch_start}-{batch_end}，保留为待重试")
-        save_batch_status(
+        next_status = save_empty_or_confirmed_status(
             conn,
             rpt_date,
             QFA_REPORT_BATCH_KEY,
             batch_start,
             batch_end,
-            "empty",
-            0,
-            0,
-            "Wind 请求成功但整批返回空值",
         )
         conn.commit()
-        return "empty", 0
+        if next_status == "confirmed_empty":
+            print(f"空结果: {QFA_REPORT_BATCH_KEY} {rpt_date} {batch_start}-{batch_end}，已确认为空，后续不再重试")
+        else:
+            print(f"空结果: {QFA_REPORT_BATCH_KEY} {rpt_date} {batch_start}-{batch_end}，等待下次确认")
+        return next_status, 0
 
     upsert_financial_reports(conn, df, trading_days)
     save_batch_status(
@@ -938,6 +982,8 @@ def summarize_progress(conn):
             field_key,
             COUNT(*) AS batch_count,
             SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_batches,
+            SUM(CASE WHEN status = 'empty' THEN 1 ELSE 0 END) AS empty_batches,
+            SUM(CASE WHEN status = 'confirmed_empty' THEN 1 ELSE 0 END) AS confirmed_empty_batches,
             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_batches,
             SUM(non_null_count) AS non_null_count
         FROM fetch_batches

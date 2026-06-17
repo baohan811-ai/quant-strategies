@@ -27,8 +27,20 @@ DEFAULT_PRICE_FIELDS = ["open", "high", "low", "close", "volume", "amt"]
 DEFAULT_ADJUST_CHECK_DAYS = 10
 DEFAULT_ADJUST_TOLERANCE = 0.0001
 DEFAULT_INCREMENTAL_REFRESH_DAYS = 15
+DEFAULT_INCREMENTAL_CONSISTENCY_TOLERANCE = 0.0001
+DEFAULT_CORPORATE_ACTION_LOOKBACK_DAYS = 7
+DEFAULT_CORPORATE_ACTION_RPT_LOOKBACK_QUARTERS = 4
 DEFAULT_INDUSTRY_FIELD = "wicsname2024"
 DEFAULT_INDUSTRY_OPTIONS = "tradeDate={trade_date};industryType=1;"
+CORPORATE_ACTION_FIELDS = [
+    "div_exdate",
+    "div_cashbeforetax",
+    "div_capitalization",
+    "div_stock",
+    "div_recorddate",
+    "div_paydate",
+    "div_progress",
+]
 
 
 def import_price_pickle(cache_prefix, field, db_path=MARKET_DB_PATH, chunk_size=100000, adjusted="F"):
@@ -108,6 +120,30 @@ def save_stock_universe(conn, universe_name, universe_df):
     conn.commit()
 
 
+def ensure_corporate_action_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS corporate_action_events (
+            wind_code TEXT NOT NULL,
+            sec_name TEXT,
+            rpt_date TEXT NOT NULL,
+            ex_date TEXT NOT NULL,
+            record_date TEXT,
+            pay_date TEXT,
+            cash_before_tax REAL,
+            capitalization_ratio REAL,
+            stock_dividend_ratio REAL,
+            progress TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (wind_code, rpt_date, ex_date)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_corporate_action_events_ex_date
+        ON corporate_action_events (ex_date)
+    """)
+    conn.commit()
+
+
 def quarter_key(date_value):
     ts = pd.Timestamp(date_value)
     quarter = (ts.month - 1) // 3 + 1
@@ -179,6 +215,52 @@ def get_wind_sector_constituents(w, sector_id):
         "wind_code": data.Data[code_idx],
         "sec_name": data.Data[name_idx],
     })
+
+
+def get_historical_universe_constituents(conn, universe_name, start_date, end_date):
+    prior_snapshot = pd.read_sql_query(
+        """
+        SELECT snapshot_date, wind_code, sec_name
+        FROM universe_constituents_snapshot
+        WHERE universe_name = ?
+          AND snapshot_date = (
+              SELECT MAX(snapshot_date)
+              FROM universe_constituents_snapshot
+              WHERE universe_name = ?
+                AND snapshot_date < ?
+          )
+        """,
+        conn,
+        params=[universe_name, universe_name, start_date],
+    )
+    range_snapshots = pd.read_sql_query(
+        """
+        SELECT snapshot_date, wind_code, sec_name
+        FROM universe_constituents_snapshot
+        WHERE universe_name = ?
+          AND snapshot_date >= ?
+          AND snapshot_date <= ?
+        ORDER BY snapshot_date, wind_code
+        """,
+        conn,
+        params=[universe_name, start_date, end_date],
+    )
+    snapshots = pd.concat([prior_snapshot, range_snapshots], ignore_index=True)
+    if snapshots.empty:
+        raise RuntimeError(f"没有找到 {universe_name} 历史成分快照：{start_date} ~ {end_date}")
+    universe_df = (
+        snapshots.sort_values(["wind_code", "snapshot_date"])
+        .drop_duplicates("wind_code", keep="last")
+        [["wind_code", "sec_name"]]
+        .sort_values("wind_code")
+        .reset_index(drop=True)
+    )
+    print(
+        f"从历史成分快照读取股票池：{universe_name}，"
+        f"快照 {snapshots['snapshot_date'].min()} ~ {snapshots['snapshot_date'].max()}，"
+        f"历史并集 {len(universe_df)} 只"
+    )
+    return universe_df
 
 
 def get_wind_industry_batch(w, universe_df, field, options, batch_size):
@@ -289,6 +371,109 @@ def update_industries_from_wind(
         conn.close()
         if wind_started:
             w.close()
+
+
+def recent_report_dates(end_date, lookback_quarters):
+    end_ts = pd.Timestamp(end_date)
+    quarter_ends = []
+    year = end_ts.year
+    while len(quarter_ends) < lookback_quarters:
+        for month, day in [(12, 31), (9, 30), (6, 30), (3, 31)]:
+            rpt = pd.Timestamp(year=year, month=month, day=day)
+            if rpt <= end_ts:
+                quarter_ends.append(rpt)
+        year -= 1
+    return [date.strftime("%Y%m%d") for date in sorted(set(quarter_ends), reverse=True)[:lookback_quarters]]
+
+
+def date_value_to_string(value):
+    if value is None or pd.isna(value):
+        return None
+    return pd.Timestamp(value).strftime("%Y-%m-%d")
+
+
+def fetch_corporate_action_events(w, universe_df, rpt_dates, batch_size):
+    rows = []
+    codes = universe_df["wind_code"].tolist()
+    code_to_name = dict(zip(universe_df["wind_code"], universe_df["sec_name"]))
+    fields = ",".join(CORPORATE_ACTION_FIELDS)
+    for rpt_date in rpt_dates:
+        for batch_start in range(0, len(codes), batch_size):
+            batch_end = min(batch_start + batch_size, len(codes))
+            batch_codes = codes[batch_start:batch_end]
+            print(f"拉取除权除息事件: rptDate={rpt_date} 股票 {batch_start}-{batch_end}")
+            data = w.wss(batch_codes, fields, f"rptDate={rpt_date}")
+            if data.ErrorCode != 0:
+                outmessage = ""
+                if getattr(data, "Data", None) and len(data.Data) > 0 and len(data.Data[0]) > 0:
+                    outmessage = str(data.Data[0][0])
+                print(f"除权除息事件拉取失败: rptDate={rpt_date} ErrorCode={data.ErrorCode} {outmessage}")
+                continue
+
+            field_data = {
+                field.lower(): values
+                for field, values in zip(data.Fields, data.Data)
+            }
+            ex_dates = field_data.get("div_exdate", [])
+            for idx, code in enumerate(batch_codes):
+                ex_date = date_value_to_string(ex_dates[idx] if idx < len(ex_dates) else None)
+                if not ex_date:
+                    continue
+                rows.append({
+                    "wind_code": code,
+                    "sec_name": code_to_name.get(code),
+                    "rpt_date": pd.Timestamp(rpt_date).strftime("%Y-%m-%d"),
+                    "ex_date": ex_date,
+                    "record_date": date_value_to_string(field_data.get("div_recorddate", [None] * len(batch_codes))[idx]),
+                    "pay_date": date_value_to_string(field_data.get("div_paydate", [None] * len(batch_codes))[idx]),
+                    "cash_before_tax": field_data.get("div_cashbeforetax", [None] * len(batch_codes))[idx],
+                    "capitalization_ratio": field_data.get("div_capitalization", [None] * len(batch_codes))[idx],
+                    "stock_dividend_ratio": field_data.get("div_stock", [None] * len(batch_codes))[idx],
+                    "progress": field_data.get("div_progress", [None] * len(batch_codes))[idx],
+                })
+    return pd.DataFrame(rows)
+
+
+def save_corporate_action_events(conn, events_df):
+    ensure_corporate_action_table(conn)
+    if events_df.empty:
+        return 0
+
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = []
+    for row in events_df.itertuples(index=False):
+        rows.append((
+            row.wind_code,
+            row.sec_name,
+            row.rpt_date,
+            row.ex_date,
+            row.record_date,
+            row.pay_date,
+            None if pd.isna(row.cash_before_tax) else float(row.cash_before_tax),
+            None if pd.isna(row.capitalization_ratio) else float(row.capitalization_ratio),
+            None if pd.isna(row.stock_dividend_ratio) else float(row.stock_dividend_ratio),
+            row.progress,
+            updated_at,
+        ))
+    conn.executemany("""
+        INSERT INTO corporate_action_events (
+            wind_code, sec_name, rpt_date, ex_date, record_date, pay_date,
+            cash_before_tax, capitalization_ratio, stock_dividend_ratio,
+            progress, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(wind_code, rpt_date, ex_date) DO UPDATE SET
+            sec_name = excluded.sec_name,
+            record_date = excluded.record_date,
+            pay_date = excluded.pay_date,
+            cash_before_tax = excluded.cash_before_tax,
+            capitalization_ratio = excluded.capitalization_ratio,
+            stock_dividend_ratio = excluded.stock_dividend_ratio,
+            progress = excluded.progress,
+            updated_at = excluded.updated_at
+    """, rows)
+    conn.commit()
+    return len(rows)
 
 
 def iter_date_chunks(start_date, end_date, chunk="Y"):
@@ -409,6 +594,58 @@ def get_wsd_matrix(w, codes, field, query_start_date, query_end_date, batch_size
     return df
 
 
+def get_wsd_matrix_for_dates(w, codes, field, query_dates, batch_size, price_option="PriceAdj=F"):
+    frames = []
+    query_dates = [pd.Timestamp(date).strftime("%Y-%m-%d") for date in query_dates]
+    for query_date in query_dates:
+        date_frames = []
+        for batch_start in range(0, len(codes), batch_size):
+            batch_end = min(batch_start + batch_size, len(codes))
+            batch_codes = codes[batch_start:batch_end]
+            print(f"拉取校验 {field}: {query_date} 股票 {batch_start}-{batch_end}")
+            data = w.wsd(batch_codes, field, query_date, query_date, price_option)
+            df, error_code, error_message = parse_wsd_matrix(data, field)
+            if error_code != 0:
+                print(f"校验拉取失败: {field} {query_date} {batch_start}-{batch_end} ErrorCode={error_code} {error_message}")
+                continue
+            date_frames.append(df)
+        if date_frames:
+            frames.append(pd.concat(date_frames, axis=1))
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, axis=0)
+    df = df.sort_index()
+    df = df.loc[~df.index.duplicated(keep="last")]
+    df = df.loc[:, ~df.columns.duplicated()]
+    return df
+
+
+def get_adjustment_check_dates(w, start_date, end_date, frequency, recent_days):
+    data = w.tdays(start_date, end_date, "")
+    if data.ErrorCode != 0 or not data.Data or len(data.Data[0]) == 0:
+        raise RuntimeError(f"交易日历拉取失败: ErrorCode={data.ErrorCode}")
+
+    trading_dates = pd.DatetimeIndex(pd.to_datetime(data.Data[0])).sort_values()
+    if frequency == "M":
+        anchors = pd.date_range(start=trading_dates[0], end=trading_dates[-1], freq="MS")
+    else:
+        anchors = pd.date_range(start=trading_dates[0], end=trading_dates[-1], freq="QS")
+
+    check_dates = []
+    for anchor in anchors:
+        future_dates = trading_dates[trading_dates >= anchor]
+        if len(future_dates) > 0:
+            check_dates.append(future_dates[0])
+
+    if recent_days > 0:
+        check_dates.extend(trading_dates[-recent_days:])
+
+    check_dates = sorted(set(pd.Timestamp(date) for date in check_dates))
+    return [date.strftime("%Y-%m-%d") for date in check_dates]
+
+
 def load_sqlite_price_matrix(conn, codes, field, start_date, end_date, adjusted="F"):
     if not codes:
         return pd.DataFrame()
@@ -431,6 +668,101 @@ def load_sqlite_price_matrix(conn, codes, field, start_date, end_date, adjusted=
     raw["trade_date"] = pd.to_datetime(raw["trade_date"])
     df = raw.pivot(index="trade_date", columns="wind_code", values="value")
     return df.reindex(columns=codes).sort_index()
+
+
+def is_forward_adjusted_price(price_option, adjusted):
+    return adjusted == "F" and "PRICEADJ=F" in price_option.upper()
+
+
+def get_previous_cached_price_date(conn, codes, start_date, adjusted="F"):
+    if not codes:
+        return None
+
+    placeholders = ",".join("?" for _ in codes)
+    row = conn.execute(f"""
+        SELECT MAX(trade_date)
+        FROM daily_prices
+        WHERE adjusted = ?
+          AND trade_date < ?
+          AND close IS NOT NULL
+          AND wind_code IN ({placeholders})
+    """, [adjusted, start_date, *codes]).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def assert_incremental_adjusted_consistency(
+    w,
+    conn,
+    codes,
+    start_date,
+    price_option,
+    adjusted,
+    batch_size,
+    tolerance=DEFAULT_INCREMENTAL_CONSISTENCY_TOLERANCE,
+):
+    if not is_forward_adjusted_price(price_option, adjusted):
+        return []
+
+    previous_date = get_previous_cached_price_date(conn, codes, start_date, adjusted=adjusted)
+    if not previous_date:
+        print("前复权一致性保护：本地没有更新起点前的 close，跳过边界检查。")
+        return []
+
+    print(
+        "前复权一致性保护：检查更新边界 "
+        f"{previous_date} -> {start_date}，仅抽查边界 close，避免半新半旧复权因子。"
+    )
+    local_close = load_sqlite_price_matrix(
+        conn,
+        codes,
+        "close",
+        previous_date,
+        previous_date,
+        adjusted=adjusted,
+    )
+    wind_close = get_wsd_matrix_for_dates(
+        w,
+        codes,
+        "close",
+        [previous_date],
+        batch_size,
+        price_option=price_option,
+    )
+    check_ts = pd.Timestamp(previous_date)
+    if check_ts not in local_close.index or check_ts not in wind_close.index:
+        raise RuntimeError(
+            f"前复权一致性保护失败：无法同时取得本地/Wind 的 {previous_date} close。"
+        )
+
+    compare_df = pd.DataFrame({
+        "local": local_close.loc[check_ts],
+        "wind": wind_close.loc[check_ts],
+    }).dropna()
+    if compare_df.empty:
+        print("前复权一致性保护：边界日没有可比较 close，跳过。")
+        return []
+
+    denominator = compare_df["local"].abs().where(compare_df["local"].abs() > 1e-12)
+    compare_df["diff_ratio"] = (compare_df["wind"] - compare_df["local"]).abs() / denominator
+    drift_df = compare_df[compare_df["diff_ratio"] > tolerance].sort_values("diff_ratio", ascending=False)
+    if drift_df.empty:
+        print("前复权一致性保护：边界 close 与 Wind 一致，允许增量写入。")
+        return []
+
+    sample = []
+    for code, row in drift_df.head(20).iterrows():
+        sample.append(
+            f"{code}: local={row['local']:.6g}, wind={row['wind']:.6g}, "
+            f"diff={row['diff_ratio']:.2%}"
+        )
+    message = (
+        "前复权一致性保护触发：更新起点前的本地 close 已不同于 Wind 当前前复权 close，"
+        "继续增量写入会造成半新半旧复权序列。\n"
+        f"边界日期：{previous_date}；异常股票数：{len(drift_df)}；样例：\n"
+        + "\n".join(sample)
+    )
+    print(message)
+    return drift_df.index.tolist()
 
 
 def upsert_price_field(conn, df, field, adjusted="F", chunk_size=100000):
@@ -580,6 +912,68 @@ def refresh_codes_from_wind(
                 print(f"  写入 {non_null_count} 个非空值")
 
 
+def corporate_action_refresh(
+    db_path,
+    universe_name,
+    sector_id,
+    start_date,
+    end_date,
+    fields,
+    batch_size,
+    date_chunk,
+    event_lookback_days,
+    rpt_lookback_quarters,
+):
+    from WindPy import w
+
+    event_start_date = (
+        pd.Timestamp(end_date) - timedelta(days=event_lookback_days - 1)
+    ).strftime("%Y-%m-%d")
+    event_end_date = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+    rpt_dates = recent_report_dates(end_date, rpt_lookback_quarters)
+
+    w.start()
+    conn = sqlite3.connect(db_path)
+    try:
+        universe_df = get_wind_sector_constituents(w, sector_id)
+        save_stock_universe(conn, universe_name, universe_df)
+        events_df = fetch_corporate_action_events(w, universe_df, rpt_dates, batch_size)
+        saved_count = save_corporate_action_events(conn, events_df)
+        print(f"除权除息事件写入/更新：{saved_count} 条")
+
+        if events_df.empty:
+            print("近期报告期没有返回除权除息事件，无需回刷。")
+            return
+
+        events_df = events_df[
+            (events_df["ex_date"] >= event_start_date)
+            & (events_df["ex_date"] <= event_end_date)
+        ].copy()
+        if events_df.empty:
+            print(f"近 {event_lookback_days} 天没有除权除息事件，无需回刷。")
+            return
+
+        event_codes = sorted(events_df["wind_code"].dropna().unique().tolist())
+        print(
+            f"近 {event_lookback_days} 天除权除息股票 {len(event_codes)} 只，"
+            f"事件区间 {event_start_date} ~ {event_end_date}"
+        )
+        print(", ".join(event_codes[:50]) + (" ..." if len(event_codes) > 50 else ""))
+        refresh_codes_from_wind(
+            w,
+            conn,
+            event_codes,
+            fields,
+            start_date,
+            end_date,
+            batch_size,
+            date_chunk,
+        )
+    finally:
+        conn.close()
+        w.close()
+
+
 def fetch_price_batch_from_wind(
     w,
     conn,
@@ -592,9 +986,13 @@ def fetch_price_batch_from_wind(
     batch_end,
     price_option,
     adjusted,
+    force_refresh=False,
 ):
     date_range = f"{query_start_date}~{query_end_date}"
-    if price_batch_status(conn, dataset, date_range, field, batch_start, batch_end) == "success":
+    if (
+        not force_refresh
+        and price_batch_status(conn, dataset, date_range, field, batch_start, batch_end) == "success"
+    ):
         return "skip", 0
 
     batch_codes = codes[batch_start:batch_end]
@@ -645,21 +1043,82 @@ def update_prices_from_wind(
     date_chunk,
     price_option,
     adjusted,
+    force_refresh=False,
+    use_historical_universe_snapshots=False,
+    skip_adjust_consistency_guard=False,
+    repair_adjust_drift=False,
+    adjust_history_start_date=DEFAULT_START_DATE,
 ):
     from WindPy import w
 
     w.start()
     conn = sqlite3.connect(db_path)
     try:
-        universe_df = get_wind_sector_constituents(w, sector_id)
+        if use_historical_universe_snapshots:
+            universe_df = get_historical_universe_constituents(conn, universe_name, start_date, end_date)
+        else:
+            universe_df = get_wind_sector_constituents(w, sector_id)
         save_stock_universe(conn, universe_name, universe_df)
         codes = universe_df["wind_code"].tolist()
         dataset = f"daily_prices:{universe_name}:{adjusted}"
+        if use_historical_universe_snapshots:
+            dataset = f"{dataset}:historical"
         print(f"股票池：{universe_name}，股票数：{len(codes)}")
         print(f"行情区间：{start_date} ~ {end_date}")
         print(f"字段：{', '.join(fields)}")
         print(f"价格口径：{price_option} / adjusted={adjusted}")
         print(f"每批股票数：{batch_size}")
+        print(f"强制覆盖已成功批次：{force_refresh}")
+
+        if not skip_adjust_consistency_guard and not force_refresh:
+            drift_codes = assert_incremental_adjusted_consistency(
+                w,
+                conn,
+                codes,
+                start_date,
+                price_option,
+                adjusted,
+                batch_size,
+            )
+            if drift_codes:
+                if not repair_adjust_drift:
+                    raise RuntimeError(
+                        "前复权一致性保护已发现漂移股票。"
+                        "请加 --repair-adjust-drift 自动回刷漂移股票历史，"
+                        "或手工处理后再增量更新。"
+                    )
+                if not is_forward_adjusted_price(price_option, adjusted):
+                    raise RuntimeError("--repair-adjust-drift 仅支持 PriceAdj=F / adjusted=F")
+                print(
+                    f"自动修复前复权漂移股票：{len(drift_codes)} 只，"
+                    f"回刷 {adjust_history_start_date} ~ {end_date}"
+                )
+                refresh_codes_from_wind(
+                    w,
+                    conn,
+                    drift_codes,
+                    fields,
+                    adjust_history_start_date,
+                    end_date,
+                    batch_size,
+                    date_chunk,
+                )
+                second_drift_codes = assert_incremental_adjusted_consistency(
+                    w,
+                    conn,
+                    codes,
+                    start_date,
+                    price_option,
+                    adjusted,
+                    batch_size,
+                )
+                if second_drift_codes:
+                    raise RuntimeError(
+                        "自动修复后仍发现前复权漂移股票，已停止增量写入。"
+                        f"剩余异常股票数：{len(second_drift_codes)}"
+                    )
+        elif skip_adjust_consistency_guard:
+            print("前复权一致性保护：已按参数显式跳过。")
 
         status_counts = {"success": 0, "skip": 0, "failed": 0}
         for chunk_start, chunk_end in iter_date_chunks(start_date, end_date, date_chunk):
@@ -678,6 +1137,7 @@ def update_prices_from_wind(
                         batch_end,
                         price_option,
                         adjusted,
+                        force_refresh=force_refresh,
                     )
                     status_counts[status] = status_counts.get(status, 0) + 1
 
@@ -706,10 +1166,11 @@ def smart_adjustment_refresh(
     date_chunk,
     check_days,
     tolerance,
+    deep_adjust_check=False,
+    adjust_check_frequency="Q",
 ):
     from WindPy import w
 
-    check_start = (pd.Timestamp(end_date) - timedelta(days=check_days - 1)).strftime("%Y-%m-%d")
     w.start()
     conn = sqlite3.connect(db_path)
     try:
@@ -718,11 +1179,28 @@ def smart_adjustment_refresh(
         codes = universe_df["wind_code"].tolist()
 
         print(f"智能复权校验股票池：{universe_name}，股票数：{len(codes)}")
-        print(f"校验区间：{check_start} ~ {end_date}")
         print(f"偏差阈值：{tolerance:.6f}")
 
-        sqlite_close = load_sqlite_price_matrix(conn, codes, "close", check_start, end_date)
-        wind_close = get_wsd_matrix(w, codes, "close", check_start, end_date, batch_size)
+        if deep_adjust_check:
+            check_dates = get_adjustment_check_dates(
+                w,
+                start_date,
+                end_date,
+                adjust_check_frequency,
+                check_days,
+            )
+            print(
+                f"深度前复权校验日期：{len(check_dates)} 个，"
+                f"{check_dates[0]} ~ {check_dates[-1]}，频率={adjust_check_frequency}"
+            )
+            sqlite_close = load_sqlite_price_matrix(conn, codes, "close", check_dates[0], check_dates[-1])
+            sqlite_close = sqlite_close.reindex(pd.to_datetime(check_dates))
+            wind_close = get_wsd_matrix_for_dates(w, codes, "close", check_dates, batch_size)
+        else:
+            check_start = (pd.Timestamp(end_date) - timedelta(days=check_days - 1)).strftime("%Y-%m-%d")
+            print(f"校验区间：{check_start} ~ {end_date}")
+            sqlite_close = load_sqlite_price_matrix(conn, codes, "close", check_start, end_date)
+            wind_close = get_wsd_matrix(w, codes, "close", check_start, end_date, batch_size)
         drift_codes = find_adjustment_drift_codes(sqlite_close, wind_close, tolerance)
 
         if not drift_codes:
@@ -752,6 +1230,11 @@ def main():
     parser.add_argument("--fundamentals", action="store_true", help="运行全部A股基础基本面更新")
     parser.add_argument("--import-price-pkl", nargs="*", default=[], help="从现有 pkl 导入行情，例如：全部A股 中证800")
     parser.add_argument("--prices-from-wind", action="store_true", help="直接从 Wind 拉取日频行情写入 SQLite")
+    parser.add_argument("--force-price-refresh", action="store_true", help="忽略已成功批次状态，强制从 Wind 重拉并覆盖行情")
+    parser.add_argument("--skip-adjust-consistency-guard", action="store_true", help="跳过前复权增量写入边界一致性保护，仅限手工修复时使用")
+    parser.add_argument("--repair-adjust-drift", action="store_true", help="增量更新发现前复权漂移时，先回刷漂移股票历史再继续更新")
+    parser.add_argument("--use-historical-universe-snapshots", action="store_true", help="使用本地历史成分快照并集作为行情股票池")
+    parser.add_argument("--corporate-action-refresh", action="store_true", help="抓取近期除权除息事件，并回刷事件股票历史前复权行情")
     parser.add_argument("--industries-from-wind", action="store_true", help="从 Wind 拉取股票所属一级行业写入 SQLite，默认每季度更新一次")
     parser.add_argument("--smart-adjust-refresh", action="store_true", help="校验最近 close 偏差，仅回刷疑似除权复权变化个股")
     parser.add_argument("--universe-name", default="全部A股")
@@ -771,6 +1254,10 @@ def main():
     parser.add_argument("--date-chunk", choices=["Y", "Q", "ALL"], default="Y")
     parser.add_argument("--check-days", type=int, default=DEFAULT_ADJUST_CHECK_DAYS)
     parser.add_argument("--adjust-tolerance", type=float, default=DEFAULT_ADJUST_TOLERANCE)
+    parser.add_argument("--deep-adjust-check", action="store_true", help="用历史锚点日期检查前复权口径漂移，而不只检查最近几天")
+    parser.add_argument("--adjust-check-frequency", choices=["M", "Q"], default="Q", help="深度前复权检查锚点频率")
+    parser.add_argument("--event-lookback-days", type=int, default=DEFAULT_CORPORATE_ACTION_LOOKBACK_DAYS)
+    parser.add_argument("--event-rpt-lookback-quarters", type=int, default=DEFAULT_CORPORATE_ACTION_RPT_LOOKBACK_QUARTERS)
     args = parser.parse_args()
     effective_start_date = args.start_date
     if args.refresh_days is not None:
@@ -801,6 +1288,11 @@ def main():
             date_chunk=args.date_chunk,
             price_option=args.price_option,
             adjusted=args.adjusted,
+            force_refresh=args.force_price_refresh,
+            use_historical_universe_snapshots=args.use_historical_universe_snapshots,
+            skip_adjust_consistency_guard=args.skip_adjust_consistency_guard,
+            repair_adjust_drift=args.repair_adjust_drift,
+            adjust_history_start_date=args.adjust_history_start_date,
         )
 
     if args.industries_from_wind:
@@ -816,6 +1308,20 @@ def main():
             force=args.force_industry_refresh,
         )
 
+    if args.corporate_action_refresh:
+        corporate_action_refresh(
+            db_path=args.db_path,
+            universe_name=args.universe_name,
+            sector_id=args.sector_id,
+            start_date=args.adjust_history_start_date,
+            end_date=args.end_date,
+            fields=args.price_fields,
+            batch_size=args.batch_size,
+            date_chunk=args.date_chunk,
+            event_lookback_days=args.event_lookback_days,
+            rpt_lookback_quarters=args.event_rpt_lookback_quarters,
+        )
+
     if args.smart_adjust_refresh:
         smart_adjustment_refresh(
             db_path=args.db_path,
@@ -828,6 +1334,8 @@ def main():
             date_chunk=args.date_chunk,
             check_days=args.check_days,
             tolerance=args.adjust_tolerance,
+            deep_adjust_check=args.deep_adjust_check,
+            adjust_check_frequency=args.adjust_check_frequency,
         )
 
 

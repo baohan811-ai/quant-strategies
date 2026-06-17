@@ -205,7 +205,14 @@ if TRADE_START_DATE is not None:
     if trade_start_dt > end_dt.date():
         raise ValueError("TRADE_START_DATE 不能晚于 end_date，请检查参数设置。")
 
-end_date = ensure_market_data_updated(w, end_date)
+end_date = ensure_market_data_updated(
+    w,
+    end_date,
+    universe_name=CACHE_PREFIX,
+    sector_id=sector_id,
+    price_fields=["open", "high", "low", "close", "volume", "amt"],
+    target_codes=stock_codes,
+)
 end_dt = pd.Timestamp(end_date).to_pydatetime()
 
 # =========================
