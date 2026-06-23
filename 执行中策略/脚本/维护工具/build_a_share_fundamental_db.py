@@ -22,6 +22,7 @@ WIND_WEEKLY_STRATEGY_RESERVE = 1500000
 DEFAULT_WIND_CELL_BUDGET = 300000
 WIND_QUOTA_ERROR_CODES = {-40521007, -40522017}
 DEFAULT_EMPTY_CONFIRM_RETRIES = 2
+DAILY_VALUATION_FORCE_START_ENV = "DAILY_VALUATION_FORCE_START"
 
 FUNDAMENTAL_FIELDS = {
     "pe_ttm": "pe_ttm",
@@ -104,6 +105,16 @@ def get_empty_confirm_retries():
         return max(1, int(value))
     except ValueError:
         raise ValueError(f"WIND_EMPTY_CONFIRM_RETRIES 必须是整数，当前值: {value}")
+
+
+def get_optional_date_env(name):
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    try:
+        return normalize_date(value.strip())
+    except Exception as exc:
+        raise ValueError(f"{name} 必须是 YYYY-MM-DD 格式，当前值: {value}") from exc
 
 
 def normalize_date(value):
@@ -1051,6 +1062,21 @@ def main():
             f"日频估值：{len(daily_valuation_chunks)} 个年度区间，"
             f"{daily_valuation_chunks[0][0]} ~ {daily_valuation_chunks[-1][1]}"
         )
+        force_daily_valuation_start = get_optional_date_env(DAILY_VALUATION_FORCE_START_ENV)
+        force_daily_valuation_chunks = []
+        if force_daily_valuation_start is not None:
+            if pd.Timestamp(force_daily_valuation_start) > pd.Timestamp(end_date):
+                print(
+                    f"{DAILY_VALUATION_FORCE_START_ENV}={force_daily_valuation_start} "
+                    f"晚于结束日期 {end_date}，跳过强制补拉"
+                )
+            else:
+                force_daily_valuation_chunks = [(force_daily_valuation_start, end_date)]
+                print(
+                    "日频估值强制补拉："
+                    f"{force_daily_valuation_start} ~ {end_date}，"
+                    "使用独立批次键覆盖已有年度 success 的尾部缺口"
+                )
 
         for trade_date in snapshot_dates:
             for field_key, wind_field in FUNDAMENTAL_FIELDS.items():
@@ -1084,6 +1110,23 @@ def main():
                         budget,
                     )
                     status_counts[status] = status_counts.get(status, 0) + 1
+
+        for chunk_start, chunk_end in force_daily_valuation_chunks:
+            for field_key, wind_field in DAILY_VALUATION_FIELDS.items():
+                for batch_start in range(0, len(codes), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(codes))
+                    status, _ = fetch_daily_valuation_field_batch(
+                        conn,
+                        codes,
+                        field_key,
+                        wind_field,
+                        chunk_start,
+                        chunk_end,
+                        batch_start,
+                        batch_end,
+                        budget,
+                    )
+                    status_counts[f"force_{status}"] = status_counts.get(f"force_{status}", 0) + 1
 
         for rpt_date in report_dates:
             for batch_start in range(0, len(codes), BATCH_SIZE):

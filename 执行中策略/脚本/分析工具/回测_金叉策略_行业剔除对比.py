@@ -167,6 +167,25 @@ def score_details(ma5, ma60, volume):
     return ma5_ma60_gap_score + ma60_5d_trend_score + volume_ratio_score
 
 
+def build_industry_relative_strength_mask(close_df, member, meta, lookback, min_excess_return):
+    code_to_industry = meta["industry_level1"].fillna("未分类").to_dict()
+    lookback_ret = close_df / close_df.shift(lookback) - 1
+    universe_ret = lookback_ret.where(member).mean(axis=1)
+    allowed = pd.DataFrame(True, index=close_df.index, columns=close_df.columns)
+
+    for industry in sorted(set(code_to_industry.values())):
+        industry_codes = [code for code, code_industry in code_to_industry.items() if code_industry == industry]
+        industry_codes = [code for code in industry_codes if code in close_df.columns]
+        if not industry_codes:
+            continue
+        industry_ret = lookback_ret[industry_codes].where(member[industry_codes]).mean(axis=1)
+        industry_excess = industry_ret - universe_ret
+        industry_allowed = industry_excess >= min_excess_return
+        allowed.loc[:, industry_codes] = industry_allowed.reindex(allowed.index).fillna(False).to_numpy()[:, None]
+
+    return allowed
+
+
 def get_limit_ratio(code, name):
     name = str(name).upper()
     if "ST" in name:
@@ -182,20 +201,33 @@ def is_delisted(code, code_to_name):
     return "退市" in str(code_to_name.get(code, ""))
 
 
-def evaluate_sell(holding_info, open_price, low_price):
+def evaluate_sell(holding_info, open_price, low_price, drawdown=PEAK_RETRACE_SELL_DRAWDOWN, reason_prefix="前高回撤"):
     entry_price = holding_info["entry_price"]
     prev_peak_price = holding_info["peak_price"]
     max_profit = prev_peak_price / entry_price - 1 if entry_price > 0 else -np.inf
     if prev_peak_price <= 0:
         return np.nan, "", max_profit, prev_peak_price
-    retrace_price = prev_peak_price * (1 - PEAK_RETRACE_SELL_DRAWDOWN)
+    retrace_price = prev_peak_price * (1 - drawdown)
     if low_price <= retrace_price:
         sell_price = open_price if open_price < retrace_price else retrace_price
-        return sell_price, f"前高回撤{PEAK_RETRACE_SELL_DRAWDOWN:.2%}卖出", max_profit, prev_peak_price
+        return sell_price, f"{reason_prefix}{drawdown:.2%}卖出", max_profit, prev_peak_price
     return np.nan, "", max_profit, prev_peak_price
 
 
-def run_backtest(variant_name, excluded_mask, panel, member, meta):
+def run_backtest(
+    variant_name,
+    excluded_mask,
+    panel,
+    member,
+    meta,
+    industry_cap=None,
+    industry_cap_map=None,
+    concentration_stop=None,
+    signal_valid_days=1,
+    industry_relative_filter=None,
+    concentration_buy_rule=None,
+    industry_weight_downweight=None,
+):
     open_df = panel["open"]
     high_df = panel["high"]
     low_df = panel["low"]
@@ -203,6 +235,7 @@ def run_backtest(variant_name, excluded_mask, panel, member, meta):
     volume_df = panel["volume"]
 
     code_to_name = meta["sec_name"].to_dict()
+    code_to_industry = meta["industry_level1"].fillna("未分类").to_dict()
     dates = close_df.index
     trade_start_ts = pd.Timestamp(TRADE_START_DATE)
 
@@ -216,11 +249,32 @@ def run_backtest(variant_name, excluded_mask, panel, member, meta):
     ma120_up = ma120 > ma120.shift(1)
     limit_gain = daily_ret <= SIGNAL_MAX_DAILY_RETURN
     candidate_score = score_details(ma5, ma60, volume_df)
+    volume_ma = volume_df.rolling(VOLUME_RATIO_LOOKBACK).mean()
+    candidate_volume_ratio = volume_df / volume_ma.replace(0, np.nan)
 
     allowed_codes = pd.Series(~excluded_mask, index=close_df.columns)
     allowed_member = member & allowed_codes.reindex(member.columns).fillna(False)
+    if industry_relative_filter is not None:
+        industry_relative_allowed = build_industry_relative_strength_mask(
+            close_df,
+            member,
+            meta,
+            industry_relative_filter["lookback"],
+            industry_relative_filter["min_excess_return"],
+        )
+        allowed_member = allowed_member & industry_relative_allowed
     golden_signal = (signal.diff() == 2) & ma60_up & ma120_up & limit_gain & allowed_member
-    buy_signal = golden_signal.shift(1).fillna(False).astype(bool)
+    shifted_signal = golden_signal.shift(1).fillna(False).astype(bool)
+    if signal_valid_days > 1:
+        buy_signal = (
+            shifted_signal
+            .rolling(signal_valid_days)
+            .max()
+            .fillna(False)
+            .astype(bool)
+        )
+    else:
+        buy_signal = shifted_signal
 
     position = pd.DataFrame(0.0, index=dates, columns=close_df.columns)
     current_holdings = {}
@@ -232,6 +286,7 @@ def run_backtest(variant_name, excluded_mask, panel, member, meta):
     closed_trade_outcomes = []
     closed_trade_reasons = []
     closed_trade_holding_days = []
+    concentration_stop_exit_count = 0
     last_valid_close_date = close_df.apply(lambda series: series.dropna().index.max())
     prev_date = None
 
@@ -293,13 +348,54 @@ def run_backtest(variant_name, excluded_mask, panel, member, meta):
                 if code not in sold_today and (code in current_holdings or available_slots > 0)
             ]
             if buy_candidates:
-                score_prev = candidate_score.loc[prev_date, buy_candidates].dropna().sort_values(ascending=False)
+                score_prev = candidate_score.loc[prev_date, buy_candidates].dropna()
+                if industry_weight_downweight is not None:
+                    current_portfolio_value = cash + sum(info["value"] for info in current_holdings.values())
+                    industry_weights = {}
+                    if current_portfolio_value > 0:
+                        for holding_code, holding_info in current_holdings.items():
+                            industry = code_to_industry.get(holding_code, "未分类")
+                            industry_weights[industry] = industry_weights.get(industry, 0.0) + holding_info["value"] / current_portfolio_value
+                    for candidate_code in score_prev.index:
+                        industry = code_to_industry.get(candidate_code, "未分类")
+                        if industry_weights.get(industry, 0.0) >= industry_weight_downweight["weight_threshold"]:
+                            score_prev.at[candidate_code] *= industry_weight_downweight["score_multiplier"]
+                score_prev = score_prev.sort_values(ascending=False)
                 opened_new_positions = 0
-                max_candidates = len([code for code in buy_candidates if code in current_holdings]) + available_slots
-                for code in score_prev.head(max_candidates).index:
+                for code in score_prev.index:
                     is_existing = code in current_holdings
                     if not is_existing and opened_new_positions >= available_slots:
-                        continue
+                        break
+                    industry = code_to_industry.get(code, "未分类")
+                    if industry_cap_map is not None and not is_existing:
+                        industry_holding_count = sum(
+                            1 for holding_code in current_holdings
+                            if code_to_industry.get(holding_code, "未分类") == industry
+                        )
+                        industry_limit = industry_cap_map.get(industry)
+                        if industry_limit is not None and industry_holding_count >= industry_limit:
+                            continue
+                    if industry_cap is not None and not is_existing:
+                        industry_holding_count = sum(
+                            1 for holding_code in current_holdings
+                            if code_to_industry.get(holding_code, "未分类") == industry
+                        )
+                        if industry_holding_count >= industry_cap:
+                            continue
+                    if concentration_buy_rule is not None and not is_existing:
+                        industry_holding_count = sum(
+                            1 for holding_code in current_holdings
+                            if code_to_industry.get(holding_code, "未分类") == industry
+                        )
+                        if industry_holding_count >= concentration_buy_rule["count_threshold"]:
+                            min_score = concentration_buy_rule.get("min_score")
+                            min_volume_ratio = concentration_buy_rule.get("min_volume_ratio")
+                            raw_score = candidate_score.at[prev_date, code]
+                            volume_ratio = candidate_volume_ratio.at[prev_date, code]
+                            if min_score is not None and (pd.isna(raw_score) or raw_score < min_score):
+                                continue
+                            if min_volume_ratio is not None and (pd.isna(volume_ratio) or volume_ratio < min_volume_ratio):
+                                continue
                     open_price = open_df.at[date, code]
                     high_price = high_df.at[date, code]
                     close_price = close_df.at[date, code]
@@ -342,6 +438,16 @@ def run_backtest(variant_name, excluded_mask, panel, member, meta):
                             "cost_basis": buy_value,
                         }
 
+        sell_phase_portfolio_value = cash + sum(info["value"] for info in current_holdings.values())
+        industry_holding_counts = {}
+        industry_holding_weights = {}
+        for holding_code, holding_info in current_holdings.items():
+            industry = code_to_industry.get(holding_code, "未分类")
+            industry_holding_counts[industry] = industry_holding_counts.get(industry, 0) + 1
+            industry_holding_weights[industry] = industry_holding_weights.get(industry, 0.0) + (
+                holding_info["value"] / sell_phase_portfolio_value if sell_phase_portfolio_value > 0 else 0.0
+            )
+
         for code in list(current_holdings.keys()):
             open_price = open_df.at[date, code]
             low_price = low_df.at[date, code]
@@ -355,7 +461,29 @@ def run_backtest(variant_name, excluded_mask, panel, member, meta):
             if date <= entry_date:
                 continue
 
-            sell_price, sell_reason, _, prev_peak = evaluate_sell(holding_info, open_price, low_price)
+            active_drawdown = PEAK_RETRACE_SELL_DRAWDOWN
+            sell_reason_prefix = "前高回撤"
+            if concentration_stop is not None:
+                industry = code_to_industry.get(code, "未分类")
+                count_threshold = concentration_stop.get("count_threshold")
+                weight_threshold = concentration_stop.get("weight_threshold")
+                tight_drawdown = concentration_stop.get("drawdown", PEAK_RETRACE_SELL_DRAWDOWN)
+                is_concentrated = False
+                if count_threshold is not None and industry_holding_counts.get(industry, 0) >= count_threshold:
+                    is_concentrated = True
+                if weight_threshold is not None and industry_holding_weights.get(industry, 0.0) >= weight_threshold:
+                    is_concentrated = True
+                if is_concentrated:
+                    active_drawdown = tight_drawdown
+                    sell_reason_prefix = "行业集中收紧前高回撤"
+
+            sell_price, sell_reason, _, prev_peak = evaluate_sell(
+                holding_info,
+                open_price,
+                low_price,
+                drawdown=active_drawdown,
+                reason_prefix=sell_reason_prefix,
+            )
             limit_down_blocked = False
             if pd.notna(sell_price) and pd.notna(prev_close) and prev_close > 0:
                 limit_down_price = prev_close * (1 - get_limit_ratio(code, code_to_name.get(code, code)))
@@ -370,6 +498,8 @@ def run_backtest(variant_name, excluded_mask, panel, member, meta):
                 closed_trade_returns.append(trade_return)
                 closed_trade_outcomes.append("win" if trade_return > 0 else "loss")
                 closed_trade_reasons.append(sell_reason)
+                if sell_reason.startswith("行业集中收紧"):
+                    concentration_stop_exit_count += 1
                 closed_trade_holding_days.append(holding_days)
                 cash += sell_proceeds
                 traded_amount += sell_value
@@ -455,6 +585,7 @@ def run_backtest(variant_name, excluded_mask, panel, member, meta):
         "日胜率": day_win_rate,
         "平仓笔数": trade_count,
         "单笔胜率": trade_win_rate,
+        "行业集中收紧卖出笔数": concentration_stop_exit_count,
         "首次建仓日": first_trade_date,
     }
     return metrics, nav_analysis, yearly_ret
@@ -471,6 +602,93 @@ def build_exclusion_masks(meta):
     }
 
 
+def build_industry_cap_variants(meta):
+    base_mask = pd.Series(False, index=meta.index)
+    variants = {
+        "原策略": {
+            "excluded_mask": base_mask,
+        }
+    }
+    for count_threshold in range(3, 8):
+        for drawdown in [0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.105, 0.11]:
+            variants[f"行业数量>={count_threshold}回撤{drawdown:.1%}"] = {
+                "excluded_mask": base_mask,
+                "concentration_stop": {
+                    "count_threshold": count_threshold,
+                    "drawdown": drawdown,
+                },
+            }
+    for weight_threshold in [0.15, 0.18, 0.20, 0.22, 0.25]:
+        for drawdown in [0.06, 0.07, 0.08, 0.09, 0.10]:
+            variants[f"行业权重>={weight_threshold:.0%}回撤{drawdown:.1%}"] = {
+                "excluded_mask": base_mask,
+                "concentration_stop": {
+                    "weight_threshold": weight_threshold,
+                    "drawdown": drawdown,
+                },
+            }
+    for lookback in [10, 20]:
+        for min_excess_return in [-0.03, -0.02, -0.01, 0.0]:
+            variants[f"行业相对强弱{lookback}日>={min_excess_return:.0%}"] = {
+                "excluded_mask": base_mask,
+                "industry_relative_filter": {
+                    "lookback": lookback,
+                    "min_excess_return": min_excess_return,
+                },
+            }
+            variants[f"行业相对强弱{lookback}日>={min_excess_return:.0%}+集中回撤"] = {
+                "excluded_mask": base_mask,
+                "industry_relative_filter": {
+                    "lookback": lookback,
+                    "min_excess_return": min_excess_return,
+                },
+                "concentration_stop": {
+                    "count_threshold": 6,
+                    "drawdown": 0.10,
+                },
+            }
+    for count_threshold in [3, 4, 5]:
+        for min_score in [0.02, 0.04, 0.06]:
+            variants[f"集中买入门槛{count_threshold}只评分>={min_score:.2f}"] = {
+                "excluded_mask": base_mask,
+                "concentration_buy_rule": {
+                    "count_threshold": count_threshold,
+                    "min_score": min_score,
+                },
+            }
+        for min_volume_ratio in [1.1, 1.2, 1.3]:
+            variants[f"集中买入门槛{count_threshold}只量比>={min_volume_ratio:.1f}"] = {
+                "excluded_mask": base_mask,
+                "concentration_buy_rule": {
+                    "count_threshold": count_threshold,
+                    "min_volume_ratio": min_volume_ratio,
+                },
+            }
+    for weight_threshold in [0.20, 0.25, 0.30]:
+        for score_multiplier in [0.25, 0.50, 0.75]:
+            variants[f"行业权重>={weight_threshold:.0%}买入分数x{score_multiplier:.2f}"] = {
+                "excluded_mask": base_mask,
+                "industry_weight_downweight": {
+                    "weight_threshold": weight_threshold,
+                    "score_multiplier": score_multiplier,
+                },
+            }
+    for signal_valid_days in [2, 3, 5]:
+        variants[f"信号有效{signal_valid_days}天"] = {
+            "excluded_mask": base_mask,
+            "signal_valid_days": signal_valid_days,
+        }
+        variants[f"信号有效{signal_valid_days}天+行业数量>=6回撤10%"] = {
+            "excluded_mask": base_mask,
+            "signal_valid_days": signal_valid_days,
+            "concentration_stop": {
+                "count_threshold": 6,
+                "drawdown": 0.10,
+            },
+        }
+    return variants
+
+
 def main():
     end_date = latest_complete_price_date()
     trade_start = pd.Timestamp(TRADE_START_DATE)
@@ -484,8 +702,22 @@ def main():
     metrics_rows = []
     navs = []
     yearly_rows = []
-    for variant_name, excluded_mask in build_exclusion_masks(meta).items():
-        metrics, nav, yearly_ret = run_backtest(variant_name, excluded_mask, panel, member, meta)
+    variants = build_industry_cap_variants(meta)
+    for variant_name, config in variants.items():
+        excluded_mask = config["excluded_mask"]
+        metrics, nav, yearly_ret = run_backtest(
+            variant_name,
+            excluded_mask,
+            panel,
+            member,
+            meta,
+            industry_cap=config.get("industry_cap"),
+            concentration_stop=config.get("concentration_stop"),
+            signal_valid_days=config.get("signal_valid_days", 1),
+            industry_relative_filter=config.get("industry_relative_filter"),
+            concentration_buy_rule=config.get("concentration_buy_rule"),
+            industry_weight_downweight=config.get("industry_weight_downweight"),
+        )
         metrics_rows.append(metrics)
         navs.append(nav.rename(variant_name))
         for date, value in yearly_ret.items():
@@ -500,9 +732,12 @@ def main():
     nav_df = pd.concat(navs, axis=1)
     yearly_df = pd.DataFrame(yearly_rows)
     exclusions = []
-    for variant_name, excluded_mask in build_exclusion_masks(meta).items():
+    for variant_name, config in variants.items():
+        excluded_mask = config["excluded_mask"]
+        industry_cap = config.get("industry_cap")
         excluded = meta.loc[excluded_mask, ["sec_name", "industry_level1"]].reset_index()
         excluded.insert(0, "方案", variant_name)
+        excluded.insert(1, "单行业持仓上限", industry_cap if industry_cap is not None else "")
         exclusions.append(excluded)
     exclusions_df = pd.concat(exclusions, ignore_index=True)
 

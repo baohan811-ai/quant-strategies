@@ -14,6 +14,8 @@ os.makedirs(LOG_DIR, exist_ok=True)
 FULL_ADJUSTED_REFRESH_INTERVAL_DAYS = 7
 FULL_ADJUSTED_REFRESH_START_DATE = "2018-01-01"
 FULL_ADJUSTED_REFRESH_METADATA_KEY = "full_adjusted_refresh:全部A股:last_run_date"
+FULL_A_SHARE_SNAPSHOT_START_DATE = "2018-01-01"
+FULL_A_SHARE_SECTOR_ID = "a001010100000000"
 ADJUST_ANCHOR_CHECK_INTERVAL_DAYS = 7
 ADJUST_ANCHOR_CHECK_METADATA_KEY = "adjust_anchor_check:全部A股:last_run_date"
 ENABLE_FULL_ADJUSTED_REFRESH = os.environ.get("ENABLE_FULL_ADJUSTED_REFRESH") == "1"
@@ -70,6 +72,7 @@ def should_run_adjust_anchor_check(today):
 
 def main():
     update_script = os.path.join("脚本", "维护工具", "update_local_market_db.py")
+    snapshot_script = os.path.join("脚本", "维护工具", "build_universe_constituent_snapshots.py")
     check_script = os.path.join("脚本", "维护工具", "check_local_market_db.py")
     eod_end_date = (datetime.today().date() - timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -193,6 +196,14 @@ def main():
             "\n===== 前复权锚点一致性校验：未到周期或已关闭，跳过 "
             f"[{datetime.now().isoformat(timespec='seconds')}] ====="
         )
+    run_step("更新全部A股历史月频成分快照", [
+        snapshot_script,
+        "--universe-name", "全部A股",
+        "--sector-id", FULL_A_SHARE_SECTOR_ID,
+        "--start-date", FULL_A_SHARE_SNAPSHOT_START_DATE,
+        "--end-date", eod_end_date,
+        "--frequency", "M",
+    ])
     run_step("更新基础基本面", [
         update_script,
         "--fundamentals",

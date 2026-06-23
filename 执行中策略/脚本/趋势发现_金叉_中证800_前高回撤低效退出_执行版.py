@@ -1,6 +1,7 @@
 from WindPy import w
 import os
 import sqlite3
+import tempfile
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -26,6 +27,8 @@ MAX_HOLDINGS = 20
 INITIAL_WEIGHT = 1 / MAX_HOLDINGS
 TRANSACTION_COST_RATE = 0.0025
 PEAK_RETRACE_SELL_DRAWDOWN = 0.1175
+CONCENTRATED_INDUSTRY_HOLDING_COUNT = 6
+CONCENTRATED_INDUSTRY_RETRACE_SELL_DRAWDOWN = 0.10
 LOW_EFFICIENCY_MIN_HOLDING_DAYS = 60
 LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD = 0.05
 LOW_EFFICIENCY_CURRENT_PROFIT_THRESHOLD = 0.00
@@ -51,9 +54,47 @@ CACHE_PREFIX = "中证800"
 WIND_INDEX_CODE = "000906.SH"
 USE_HISTORICAL_CONSTITUENTS = True
 
+RUN_PARAMETER_EXPLANATIONS = {
+    "脚本路径": "本次生成报表所使用的脚本文件位置，用于追溯版本。",
+    "脚本最后修改时间": "脚本文件在本机最后一次保存的时间，用于判断报表是否来自最新代码。",
+    "报表生成时间": "本次运行脚本并生成Excel的时间。",
+    "交易开始日期": "回测/跟踪统计从这个交易日开始计算；早于该日期的数据只用于均线和前置指标预热。",
+    "行情结束日期": "本次报表使用到的最后一个行情日期。",
+    "本地完整日线截止日期": "本地SQLite行情库中已经确认完整入库的最新交易日。",
+    "最大持仓数": "组合最多同时持有的股票数量，也是单只股票初始权重的分母。",
+    "初始目标仓位": "新买入股票的目标权重，当前等于1/最大持仓数。",
+    "交易成本率": "买卖时扣除的单边近似交易成本，用于让净值更接近真实交易。",
+    "前高回撤卖出比例": "持仓从买入后最高价回撤超过该比例时触发卖出。",
+    "行业集中持仓数量阈值": "当某个Wind一级行业当前持仓数量达到该阈值时，该行业内持仓使用更严格的前高回撤卖出比例。",
+    "行业集中前高回撤卖出比例": "行业集中时，仅该行业内个股使用的前高回撤卖出比例。",
+    "低效退出最短持仓日": "持有时间超过该交易日数后，才会检查是否属于低效持仓。",
+    "低效退出历史最高浮盈阈值": "低效退出条件之一：持仓期间最高浮盈没有超过该阈值。",
+    "低效退出当前浮盈阈值": "低效退出条件之一：当前浮盈不高于该阈值。",
+    "MA5相对MA60评分权重": "综合评分中，短期均线相对中期均线强度的权重。",
+    "MA60近5日趋势评分权重": "综合评分中，MA60自身近5日上行强度的权重。",
+    "量比评分权重": "综合评分中，成交量放大加分项的权重。",
+    "金叉日最大涨幅": "金叉当天涨幅超过该阈值会被剔除，避免追入过热信号。",
+    "使用历史成分股快照": "为True时按历史中证800成分回测，减少用当前成分回看历史造成的幸存者偏差。",
+}
+
+STRATEGY_METRIC_EXPLANATIONS = {
+    "年化收益": "按实际持仓后的净值区间折算到一年的收益率。",
+    "年化波动": "日收益波动率按252个交易日折算到一年，衡量净值波动大小。",
+    "夏普比率": "在零无风险利率假设下，年化收益相对年化波动的比例；越高说明单位波动收益越好。",
+    "最大回撤": "统计期内净值从阶段高点到后续低点的最大跌幅。",
+    "平均持仓数": "有持仓统计期内，组合每日平均持有的股票数量。",
+    "年化换手率": "日均换手率乘以252，粗略衡量一年内组合换仓频率。",
+    "日胜率": "策略日收益大于0的交易日占比。",
+    "平仓笔数": "已经完成卖出的持仓片段数量。",
+    "单笔盈利数": "平仓后单笔收益为正的交易数量。",
+    "单笔平局数": "平仓后单笔收益等于0或接近0的交易数量。",
+    "单笔亏损数": "平仓后单笔收益为负的交易数量。",
+    "单笔胜率(平局不计入)": "只在盈利和亏损交易中计算胜率，不把平局计入分母。",
+}
+
 
 def build_run_parameters(actual_end_date):
-    return pd.DataFrame([
+    df = pd.DataFrame([
         {"参数": "脚本路径", "数值": os.path.abspath(__file__)},
         {
             "参数": "脚本最后修改时间",
@@ -67,6 +108,8 @@ def build_run_parameters(actual_end_date):
         {"参数": "初始目标仓位", "数值": INITIAL_WEIGHT},
         {"参数": "交易成本率", "数值": TRANSACTION_COST_RATE},
         {"参数": "前高回撤卖出比例", "数值": PEAK_RETRACE_SELL_DRAWDOWN},
+        {"参数": "行业集中持仓数量阈值", "数值": CONCENTRATED_INDUSTRY_HOLDING_COUNT},
+        {"参数": "行业集中前高回撤卖出比例", "数值": CONCENTRATED_INDUSTRY_RETRACE_SELL_DRAWDOWN},
         {"参数": "低效退出最短持仓日", "数值": LOW_EFFICIENCY_MIN_HOLDING_DAYS},
         {"参数": "低效退出历史最高浮盈阈值", "数值": LOW_EFFICIENCY_MAX_PROFIT_THRESHOLD},
         {"参数": "低效退出当前浮盈阈值", "数值": LOW_EFFICIENCY_CURRENT_PROFIT_THRESHOLD},
@@ -76,6 +119,8 @@ def build_run_parameters(actual_end_date):
         {"参数": "金叉日最大涨幅", "数值": SIGNAL_MAX_DAILY_RETURN},
         {"参数": "使用历史成分股快照", "数值": USE_HISTORICAL_CONSTITUENTS},
     ])
+    df["解释"] = df["参数"].map(RUN_PARAMETER_EXPLANATIONS).fillna("")
+    return df
 
 
 print("\n【本次运行核心参数】")
@@ -167,6 +212,59 @@ def build_daily_universe_member_matrix(snapshots, trade_dates, codes):
     return member
 
 
+def load_stock_industry_map(codes):
+    if not codes:
+        return {}
+
+    placeholders = ",".join("?" for _ in codes)
+    with sqlite3.connect(MARKET_DB_PATH) as conn:
+        industry_df = pd.read_sql_query(
+            f"""
+            SELECT wind_code, industry_level1
+            FROM stock_industry
+            WHERE classification_system = 'wind_level1'
+              AND wind_code IN ({placeholders})
+            """,
+            conn,
+            params=codes,
+        )
+
+    if industry_df.empty:
+        return {}
+
+    return (
+        industry_df
+        .dropna(subset=["wind_code"])
+        .drop_duplicates("wind_code", keep="last")
+        .set_index("wind_code")["industry_level1"]
+        .fillna("未分类")
+        .to_dict()
+    )
+
+
+def get_industry_name(code):
+    return code_to_industry.get(code, "未分类")
+
+
+def get_industry_holding_counts(holdings):
+    counts = {}
+    for holding_code in holdings:
+        industry = get_industry_name(holding_code)
+        counts[industry] = counts.get(industry, 0) + 1
+    return counts
+
+
+def get_applicable_retrace_drawdown(code, industry_holding_counts):
+    industry = get_industry_name(code)
+    industry_holding_count = industry_holding_counts.get(industry, 0)
+    if industry_holding_count >= CONCENTRATED_INDUSTRY_HOLDING_COUNT:
+        return (
+            CONCENTRATED_INDUSTRY_RETRACE_SELL_DRAWDOWN,
+            f"行业集中({industry_holding_count}只)",
+        )
+    return PEAK_RETRACE_SELL_DRAWDOWN, "常规"
+
+
 def get_limit_up_ratio(code, stock_name):
     stock_name = str(stock_name).upper()
     if "ST" in stock_name:
@@ -208,7 +306,14 @@ def calculate_golden_cross_score_details(ma5_df, ma60_df, volume_df):
     }
 
 
-def evaluate_intraday_sell_signal(holding_info, open_price, low_price, high_price):
+def evaluate_intraday_sell_signal(
+    holding_info,
+    open_price,
+    low_price,
+    high_price,
+    retrace_drawdown=PEAK_RETRACE_SELL_DRAWDOWN,
+    sell_reason_prefix="前高回撤",
+):
     entry_price = holding_info["entry_price"]
     prev_peak_price = holding_info["peak_price"]
     max_profit = prev_peak_price / entry_price - 1 if entry_price > 0 else -np.inf
@@ -218,11 +323,11 @@ def evaluate_intraday_sell_signal(holding_info, open_price, low_price, high_pric
     monitor_level = np.nan
 
     if prev_peak_price > 0:
-        retrace_price = prev_peak_price * (1 - PEAK_RETRACE_SELL_DRAWDOWN)
+        retrace_price = prev_peak_price * (1 - retrace_drawdown)
         monitor_level = retrace_price
         if low_price <= retrace_price:
             sell_price = open_price if open_price < retrace_price else retrace_price
-            sell_reason_text = f"前高回撤{PEAK_RETRACE_SELL_DRAWDOWN:.2%}卖出"
+            sell_reason_text = f"{sell_reason_prefix}{retrace_drawdown:.2%}卖出"
 
     return {
         "sell_price": sell_price,
@@ -306,6 +411,11 @@ if USE_HISTORICAL_CONSTITUENTS:
             f"使用中证800历史月频成分：{first_snapshot_date} ~ {last_snapshot_date}，"
             f"历史并集股票数量：{len(stock_codes)}"
         )
+
+code_to_industry = load_stock_industry_map(stock_codes)
+missing_industry_count = len([code for code in stock_codes if code not in code_to_industry])
+if missing_industry_count:
+    print(f"本地行业映射缺失数量：{missing_industry_count}，缺失股票在报表中标记为未分类。")
 
 # =========================
 # 4. 行情获取
@@ -763,6 +873,7 @@ for date in close_df.index:
                     }
 
     # 最后检查老持仓是否在今日盘中触发回撤卖出
+    industry_holding_counts = get_industry_holding_counts(current_holdings)
     for code in list(current_holdings.keys()):
         open_price = open_df.at[date, code]
         low_price = low_df.at[date, code]
@@ -775,14 +886,24 @@ for date in close_df.index:
         holding_info = current_holdings[code]
         entry_price = holding_info["entry_price"]
         entry_date = holding_info["entry_date"]
+        industry_name = get_industry_name(code)
+        industry_holding_count = industry_holding_counts.get(industry_name, 0)
+        applicable_retrace_drawdown, retrace_rule = get_applicable_retrace_drawdown(
+            code,
+            industry_holding_counts,
+        )
         if date == latest_trade_date and date <= entry_date:
             latest_intraday_stop_monitor_records.append({
                 "代码": code,
                 "名称": code_to_name.get(code, code),
+                "行业": industry_name,
+                "行业持仓数": industry_holding_count,
                 "开仓日期": entry_date,
                 "开仓价": entry_price,
                 "前高价": holding_info["peak_price"],
                 "历史最大浮盈": np.nan,
+                "适用回撤比例": applicable_retrace_drawdown,
+                "回撤规则": retrace_rule,
                 "监控价位": np.nan,
                 "今日开盘价": open_price,
                 "今日盘中最低": low_price,
@@ -795,7 +916,15 @@ for date in close_df.index:
         if date <= entry_date:
             continue
 
-        sell_eval = evaluate_intraday_sell_signal(holding_info, open_price, low_price, high_price)
+        sell_reason_prefix = "行业集中前高回撤" if retrace_rule.startswith("行业集中") else "前高回撤"
+        sell_eval = evaluate_intraday_sell_signal(
+            holding_info,
+            open_price,
+            low_price,
+            high_price,
+            retrace_drawdown=applicable_retrace_drawdown,
+            sell_reason_prefix=sell_reason_prefix,
+        )
         prev_peak_price = sell_eval["prev_peak_price"]
         max_profit = sell_eval["max_profit"]
         sell_price = sell_eval["sell_price"]
@@ -816,10 +945,14 @@ for date in close_df.index:
             latest_intraday_stop_monitor_records.append({
                 "代码": code,
                 "名称": code_to_name.get(code, code),
+                "行业": industry_name,
+                "行业持仓数": industry_holding_count,
                 "开仓日期": entry_date,
                 "开仓价": entry_price,
                 "前高价": prev_peak_price,
                 "历史最大浮盈": max_profit,
+                "适用回撤比例": applicable_retrace_drawdown,
+                "回撤规则": retrace_rule,
                 "监控价位": monitor_level,
                 "今日开盘价": open_price,
                 "今日盘中最低": low_price,
@@ -949,12 +1082,23 @@ else:
         .cumprod()
     )
 benchmark_nav.name = f"{benchmark_name}净值"
+benchmark_ret_analysis = benchmark_nav.pct_change().fillna(0)
+nav_output_df = pd.DataFrame({
+    "日期": nav_analysis.index.strftime("%Y-%m-%d"),
+    "策略净值": nav_analysis,
+    "策略每日涨跌幅": strategy_ret_analysis,
+    f"{benchmark_name}净值": benchmark_nav,
+    f"{benchmark_name}每日涨跌幅": benchmark_ret_analysis,
+})
+nav_output_df = nav_output_df.sort_values("日期", ascending=False).reset_index(drop=True)
 return_curve_df = pd.DataFrame({
     "日期": nav_analysis.index.strftime("%Y-%m-%d"),
     "策略累计收益": nav_analysis / nav_analysis.iloc[0] - 1,
     f"{benchmark_name}累计收益": benchmark_nav / benchmark_nav.iloc[0] - 1,
     "策略净值": nav_analysis,
     f"{benchmark_name}净值": benchmark_nav,
+    "策略每日涨跌幅": strategy_ret_analysis,
+    f"{benchmark_name}每日涨跌幅": benchmark_ret_analysis,
 })
 
 # =========================
@@ -1014,6 +1158,7 @@ stats = pd.DataFrame({
     "指标": ["年化收益","年化波动","夏普比率","最大回撤","平均持仓数","年化换手率","日胜率","平仓笔数","单笔盈利数","单笔平局数","单笔亏损数","单笔胜率(平局不计入)"],
     "数值": [annual_ret, annual_vol, sharpe, max_dd, avg_holding, annual_turnover, win_rate, trade_count, trade_win_count, trade_draw_count, trade_loss_count, trade_win_rate]
 })
+stats["解释"] = stats["指标"].map(STRATEGY_METRIC_EXPLANATIONS).fillna("")
 
 if trade_count > 0:
     close_reason_stats = pd.DataFrame({
@@ -1069,15 +1214,28 @@ position_df = position_df.sort_values(by="日期", ascending=False)
 today = position.index[-1]
 
 holding_records = []
+current_industry_holding_counts = get_industry_holding_counts(current_holdings)
 for code, info in current_holdings.items():
     latest_price = close_df.at[today, code]
     entry_price = info["entry_price"]
     float_pnl = latest_price / entry_price - 1 if entry_price > 0 and pd.notna(latest_price) else np.nan
     max_float_pnl = info["peak_price"] / entry_price - 1 if entry_price > 0 else np.nan
     holding_days = close_df.index.get_loc(today) - close_df.index.get_loc(info["entry_date"])
+    industry_name = get_industry_name(code)
+    industry_holding_count = current_industry_holding_counts.get(industry_name, 0)
+    applicable_retrace_drawdown, retrace_rule = get_applicable_retrace_drawdown(
+        code,
+        current_industry_holding_counts,
+    )
+    retrace_trigger_price = (
+        info["peak_price"] * (1 - applicable_retrace_drawdown)
+        if info["peak_price"] > 0 else np.nan
+    )
     holding_records.append({
         "代码": code,
         "名称": code_to_name.get(code, code),
+        "行业": industry_name,
+        "行业持仓数": industry_holding_count,
         "开仓日期": info["entry_date"],
         "开仓价": entry_price,
         "最新价": latest_price,
@@ -1085,6 +1243,9 @@ for code, info in current_holdings.items():
         "组合权重": position.at[today, code] if code in position.columns else 0.0,
         "持有交易日": holding_days,
         "历史最高浮盈": max_float_pnl,
+        "适用回撤比例": applicable_retrace_drawdown,
+        "卖出触发价": retrace_trigger_price,
+        "回撤规则": retrace_rule,
         "浮赢浮亏": float_pnl
     })
 
@@ -1234,7 +1395,10 @@ output_file = os.path.join(
     output_dir,
     f"金叉买入_前高回撤{PEAK_RETRACE_SELL_DRAWDOWN:.2%}卖出策略_中证800_{end_date}.xlsx",
 )
-return_curve_image_file = os.path.join(output_dir, f"收益走势图_策略_vs_{benchmark_name}_{end_date}.png")
+return_curve_image_file = os.path.join(
+    tempfile.gettempdir(),
+    f"收益走势图_策略_vs_{benchmark_name}_{end_date}_{os.getpid()}.png",
+)
 
 
 def save_return_curve_image(df, image_file):
@@ -1349,11 +1513,26 @@ run_parameters_df = build_run_parameters(end_date)
 
 with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
     run_parameters_df.to_excel(writer, sheet_name="运行参数", index=False)
-    nav_analysis.to_frame("净值").to_excel(writer, sheet_name="净值")
+    run_parameters_sheet = writer.sheets["运行参数"]
+    run_parameters_sheet.column_dimensions["A"].width = 24
+    run_parameters_sheet.column_dimensions["B"].width = 28
+    run_parameters_sheet.column_dimensions["C"].width = 88
+    nav_output_df.to_excel(writer, sheet_name="净值", index=False)
+    nav_sheet = writer.sheets["净值"]
+    nav_sheet.freeze_panes = "A2"
+    for col_letter in ["B", "D"]:
+        nav_sheet.column_dimensions[col_letter].width = 16
+    for col_letter in ["C", "E"]:
+        nav_sheet.column_dimensions[col_letter].width = 18
+        for cell in nav_sheet[col_letter][1:]:
+            cell.number_format = "0.00%"
     return_curve_df.to_excel(writer, sheet_name="收益走势图", index=False, startrow=34)
     add_return_curve_image(writer, "收益走势图", return_curve_image_file)
     stats.to_excel(writer, sheet_name="策略指标", index=False)
     metrics_sheet = writer.sheets["策略指标"]
+    metrics_sheet.column_dimensions["A"].width = 24
+    metrics_sheet.column_dimensions["B"].width = 16
+    metrics_sheet.column_dimensions["C"].width = 88
     metrics_sheet.cell(row=len(stats) + 3, column=1, value="平仓原因统计")
     close_reason_stats.to_excel(
         writer,
@@ -1372,6 +1551,12 @@ with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
     stop_df.to_excel(writer, sheet_name="最新交易日卖出", index=False)
     latest_intraday_stop_monitor_df.to_excel(writer, sheet_name="最新盘中卖出监控", index=False)
     latest_low_efficiency_sell_plan_df.to_excel(writer, sheet_name="明日低效持仓卖出", index=False)
+    for sheet in writer.sheets.values():
+        sheet.sheet_view.zoomScale = 240
+        sheet.sheet_view.zoomScaleNormal = 240
+
+if os.path.exists(return_curve_image_file):
+    os.remove(return_curve_image_file)
 
 print("\n【最新信号】")
 print(f"最新金叉触发数量: {len(golden_trigger_list)}")
