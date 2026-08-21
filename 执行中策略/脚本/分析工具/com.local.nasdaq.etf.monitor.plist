@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.nasdaq.etf.monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
+        <string>-u</string>
+        <string>/Users/han/Documents/PJ1/执行中策略/脚本/分析工具/监控_纳指ETF交易机会.py</string>
+        <string>--mode</string>
+        <string>intraday</string>
+        <string>--interval</string>
+        <string>5</string>
+        <string>--relative-drop</string>
+        <string>2</string>
+        <string>--window-minutes</string>
+        <string>3</string>
+        <string>--cooldown-minutes</string>
+        <string>15</string>
+        <string>--notify</string>
+        <string>macos</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/han/Documents/PJ1/执行中策略</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/han/Documents/PJ1/执行中策略/输出/logs/nasdaq_etf_monitor.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/han/Documents/PJ1/执行中策略/输出/logs/nasdaq_etf_monitor.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

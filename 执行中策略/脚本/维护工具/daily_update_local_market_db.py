@@ -82,7 +82,7 @@ def main():
         "--universe-name", "全部A股",
         "--end-date", eod_end_date,
         "--refresh-days", "5",
-        "--price-fields", "open", "high", "low", "close", "volume", "amt",
+        "--price-fields", "open", "high", "low", "close", "volume", "amt", "turn", "free_turn",
         "--batch-size", "500",
         "--date-chunk", "ALL",
     ])

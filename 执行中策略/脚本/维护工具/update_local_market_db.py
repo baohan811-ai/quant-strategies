@@ -23,7 +23,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 A_SHARE_SECTOR_ID = "a001010100000000"
 DEFAULT_START_DATE = "2022-01-01"
-DEFAULT_PRICE_FIELDS = ["open", "high", "low", "close", "volume", "amt"]
+DEFAULT_PRICE_FIELDS = ["open", "high", "low", "close", "volume", "amt", "turn", "free_turn"]
 DEFAULT_ADJUST_CHECK_DAYS = 10
 DEFAULT_ADJUST_TOLERANCE = 0.0001
 DEFAULT_INCREMENTAL_REFRESH_DAYS = 15

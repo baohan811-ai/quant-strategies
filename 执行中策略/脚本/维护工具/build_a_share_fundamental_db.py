@@ -1,4 +1,5 @@
 from WindPy import w
+import argparse
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -380,6 +381,50 @@ def estimate_business_days(start_date, end_date):
     return len(pd.bdate_range(start_date, end_date))
 
 
+def latest_successful_daily_valuation_end(
+    conn,
+    field_key,
+    batch_start,
+    batch_end,
+    year_start,
+    end_date,
+):
+    """返回当年该字段、该股票批次已成功抓取到的最晚日期。
+
+    进度表的 trade_date 保存为 ``开始日~结束日``。既兼容旧的
+    年度区间，也识别改造后产生的增量区间。
+    """
+    batch_field_key = f"{DAILY_VALUATION_BATCH_KEY}:{field_key}"
+    row = conn.execute(
+        """
+        SELECT MAX(SUBSTR(trade_date, INSTR(trade_date, '~') + 1))
+        FROM fetch_batches
+        WHERE field_key = ?
+          AND batch_start = ?
+          AND batch_end = ?
+          AND status = 'success'
+          AND INSTR(trade_date, '~') > 0
+          AND SUBSTR(trade_date, 1, INSTR(trade_date, '~') - 1) >= ?
+          AND SUBSTR(trade_date, INSTR(trade_date, '~') + 1) <= ?
+        """,
+        (batch_field_key, batch_start, batch_end, year_start, end_date),
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def next_incremental_trading_date(last_success_date, year_start, trading_days):
+    """返回当年日频市值批次的下一个待抓交易日。"""
+    if len(trading_days) == 0:
+        return None
+    lower_bound = pd.Timestamp(year_start)
+    if last_success_date is not None:
+        lower_bound = max(lower_bound, pd.Timestamp(last_success_date) + pd.Timedelta(days=1))
+    index = trading_days.searchsorted(lower_bound, side="left")
+    if index >= len(trading_days):
+        return None
+    return normalize_date(trading_days[index])
+
+
 def batch_status(conn, trade_date, field_key, batch_start, batch_end):
     row = conn.execute("""
         SELECT status, non_null_count, error_code
@@ -587,6 +632,121 @@ def fetch_one_batch(conn, codes, trade_date, field_key, wind_field, batch_start,
     )
     conn.commit()
     return "success", non_null_count
+
+
+def fetch_warmup_fundamental_batch(
+    conn,
+    codes,
+    trade_date,
+    batch_start,
+    batch_end,
+    budget=None,
+):
+    """预热专用：同一股票批次的待补月频字段一次 WSS 拉取。"""
+    pending_fields = []
+    for field_key, wind_field in FUNDAMENTAL_FIELDS.items():
+        status, non_null_count, error_code = batch_status(
+            conn, trade_date, field_key, batch_start, batch_end
+        )
+        label = f"{field_key} {trade_date} 股票 {batch_start}-{batch_end}"
+        if should_skip_quota_failed_batch(status, error_code, label):
+            continue
+        if status == "confirmed_empty":
+            continue
+        if status == "success" and non_null_count > 0:
+            continue
+        pending_fields.append((field_key, wind_field))
+
+    if not pending_fields:
+        return "skip", 0
+
+    batch_codes = codes[batch_start:batch_end]
+    estimated_cells = len(batch_codes) * len(pending_fields)
+    label = (
+        f"预热月频基本面 {trade_date} 股票 {batch_start}-{batch_end} "
+        f"字段 {len(pending_fields)} 个"
+    )
+    if budget is not None and not budget.reserve(label, estimated_cells):
+        return "budget_skip", 0
+
+    field_keys = [item[0] for item in pending_fields]
+    wind_fields = [item[1] for item in pending_fields]
+    print(
+        f"拉取预热月频基本面({','.join(wind_fields)}) "
+        f"{trade_date} 股票 {batch_start}-{batch_end}"
+    )
+    data = w.wss(batch_codes, ",".join(wind_fields), f"tradeDate={trade_date}")
+    if data.ErrorCode != 0 or not data.Codes or not data.Data:
+        error_message = ""
+        if data.Codes and data.Codes[0] == "ErrorReport" and data.Data:
+            error_message = str(data.Data[0][0])
+        error_code = data.ErrorCode if data.ErrorCode != 0 else -1
+        for field_key in field_keys:
+            save_batch_status(
+                conn,
+                trade_date,
+                field_key,
+                batch_start,
+                batch_end,
+                "failed",
+                0,
+                error_code,
+                error_message or "Wind 返回为空",
+            )
+        conn.commit()
+        print(f"失败: {label} ErrorCode={error_code} {error_message}")
+        return "failed", 0
+
+    if len(data.Data) != len(field_keys):
+        error_message = (
+            f"返回维度异常: fields={len(field_keys)}, "
+            f"codes={len(data.Codes)}, data_rows={len(data.Data)}"
+        )
+        for field_key in field_keys:
+            save_batch_status(
+                conn,
+                trade_date,
+                field_key,
+                batch_start,
+                batch_end,
+                "failed",
+                0,
+                -1,
+                error_message,
+            )
+        conn.commit()
+        print(f"失败: {label} {error_message}")
+        return "failed", 0
+
+    total_non_null = 0
+    for field_key, values in zip(field_keys, data.Data):
+        if not isinstance(values, list) or len(values) != len(data.Codes):
+            values = [None] * len(data.Codes)
+        frame = pd.DataFrame({
+            "trade_date": trade_date,
+            "wind_code": data.Codes,
+            field_key: pd.to_numeric(values, errors="coerce"),
+        })
+        non_null_count = upsert_fundamental_field(conn, frame, field_key)
+        total_non_null += non_null_count
+        if non_null_count == 0:
+            save_empty_or_confirmed_status(
+                conn, trade_date, field_key, batch_start, batch_end
+            )
+        else:
+            save_batch_status(
+                conn,
+                trade_date,
+                field_key,
+                batch_start,
+                batch_end,
+                "success",
+                non_null_count,
+                0,
+                "",
+            )
+    conn.commit()
+    return "success", total_non_null
 
 
 def parse_wsd_matrix(data, field_key):
@@ -1035,8 +1195,28 @@ def print_run_status(status_counts, budget):
         )
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="构建或增量更新全A股基础基本面库")
+    parser.add_argument(
+        "--warmup-only",
+        action="store_true",
+        help="仅回补预热期的月频基本面和季度财报，不抓日频市值",
+    )
+    parser.add_argument("--warmup-start-date", default="2018-01-01")
+    parser.add_argument("--warmup-end-date", default="2021-12-31")
+    return parser.parse_args()
+
+
 def main():
-    end_date = datetime.today().strftime("%Y-%m-%d")
+    args = parse_args()
+    if args.warmup_only:
+        build_start_date = normalize_date(args.warmup_start_date)
+        end_date = normalize_date(args.warmup_end_date)
+        if pd.Timestamp(end_date) < pd.Timestamp(build_start_date):
+            raise ValueError("预热结束日不能早于开始日")
+    else:
+        build_start_date = START_DATE
+        end_date = datetime.today().strftime("%Y-%m-%d")
     w.start()
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -1046,55 +1226,97 @@ def main():
         codes = universe_df["wind_code"].tolist()
         budget = WindCellBudget(get_wind_cell_budget())
         status_counts = {}
-        snapshot_dates = get_monthly_snapshot_dates(START_DATE, end_date)
-        report_dates = get_quarter_report_dates(START_DATE, end_date)
-        report_trading_days = get_trading_days(f"{pd.Timestamp(START_DATE).year - 1}-01-01", end_date)
+        snapshot_dates = get_monthly_snapshot_dates(build_start_date, end_date)
+        report_dates = get_quarter_report_dates(build_start_date, end_date)
+        report_trading_days = get_trading_days(
+            f"{pd.Timestamp(build_start_date).year - 1}-01-01",
+            end_date,
+        )
 
         print(f"数据库文件：{DB_PATH}")
+        print(f"运行模式：{'仅补预热数据' if args.warmup_only else '日常构建/增量更新'}")
         print(f"股票数量：{len(codes)}")
         print(f"月度截面：{len(snapshot_dates)} 个，{snapshot_dates[0]} ~ {snapshot_dates[-1]}")
         print(f"财报报告期：{len(report_dates)} 个，{report_dates[0]} ~ {report_dates[-1]}")
         print(f"每批股票数：{BATCH_SIZE}")
         print_budget_model(budget)
 
-        daily_valuation_chunks = list(iter_date_chunks(START_DATE, end_date, chunk="Y"))
-        print(
-            f"日频估值：{len(daily_valuation_chunks)} 个年度区间，"
-            f"{daily_valuation_chunks[0][0]} ~ {daily_valuation_chunks[-1][1]}"
-        )
-        force_daily_valuation_start = get_optional_date_env(DAILY_VALUATION_FORCE_START_ENV)
+        historical_daily_valuation_chunks = []
         force_daily_valuation_chunks = []
-        if force_daily_valuation_start is not None:
-            if pd.Timestamp(force_daily_valuation_start) > pd.Timestamp(end_date):
-                print(
-                    f"{DAILY_VALUATION_FORCE_START_ENV}={force_daily_valuation_start} "
-                    f"晚于结束日期 {end_date}，跳过强制补拉"
-                )
-            else:
-                force_daily_valuation_chunks = [(force_daily_valuation_start, end_date)]
-                print(
-                    "日频估值强制补拉："
-                    f"{force_daily_valuation_start} ~ {end_date}，"
-                    "使用独立批次键覆盖已有年度 success 的尾部缺口"
-                )
+        current_year = None
+        current_year_start = None
+        current_year_trading_days = pd.DatetimeIndex([])
+        if args.warmup_only:
+            print("日频估值：预热模式明确跳过，不消耗历史日频市值额度")
+        else:
+            daily_valuation_chunks = list(
+                iter_date_chunks(build_start_date, end_date, chunk="Y")
+            )
+            current_year = pd.Timestamp(end_date).year
+            current_year_start = f"{current_year}-01-01"
+            historical_daily_valuation_chunks = [
+                (chunk_start, chunk_end)
+                for chunk_start, chunk_end in daily_valuation_chunks
+                if pd.Timestamp(chunk_end).year < current_year
+            ]
+            current_year_trading_days = report_trading_days[
+                (report_trading_days >= pd.Timestamp(current_year_start))
+                & (report_trading_days <= pd.Timestamp(end_date))
+            ]
+            print(
+                f"日频估值：{len(historical_daily_valuation_chunks)} 个已结束年度区间，"
+                f"当年 {current_year} 按字段和股票批次增量更新"
+            )
+            force_daily_valuation_start = get_optional_date_env(
+                DAILY_VALUATION_FORCE_START_ENV
+            )
+            if force_daily_valuation_start is not None:
+                if pd.Timestamp(force_daily_valuation_start) > pd.Timestamp(end_date):
+                    print(
+                        f"{DAILY_VALUATION_FORCE_START_ENV}={force_daily_valuation_start} "
+                        f"晚于结束日期 {end_date}，跳过强制补拉"
+                    )
+                else:
+                    force_daily_valuation_chunks = [
+                        (force_daily_valuation_start, end_date)
+                    ]
+                    print(
+                        "日频估值强制补拉："
+                        f"{force_daily_valuation_start} ~ {end_date}，"
+                        "使用独立批次键覆盖已有年度 success 的尾部缺口"
+                    )
 
         for trade_date in snapshot_dates:
-            for field_key, wind_field in FUNDAMENTAL_FIELDS.items():
+            if args.warmup_only:
                 for batch_start in range(0, len(codes), BATCH_SIZE):
                     batch_end = min(batch_start + BATCH_SIZE, len(codes))
-                    status, _ = fetch_one_batch(
+                    status, _ = fetch_warmup_fundamental_batch(
                         conn,
                         codes,
                         trade_date,
-                        field_key,
-                        wind_field,
                         batch_start,
                         batch_end,
                         budget,
                     )
                     status_counts[status] = status_counts.get(status, 0) + 1
+            else:
+                for field_key, wind_field in FUNDAMENTAL_FIELDS.items():
+                    for batch_start in range(0, len(codes), BATCH_SIZE):
+                        batch_end = min(batch_start + BATCH_SIZE, len(codes))
+                        status, _ = fetch_one_batch(
+                            conn,
+                            codes,
+                            trade_date,
+                            field_key,
+                            wind_field,
+                            batch_start,
+                            batch_end,
+                            budget,
+                        )
+                        status_counts[status] = status_counts.get(status, 0) + 1
 
-        for chunk_start, chunk_end in daily_valuation_chunks:
+        # 已结束年份的起止日不再变化，继续使用固定年度批次回填。
+        for chunk_start, chunk_end in historical_daily_valuation_chunks:
             for field_key, wind_field in DAILY_VALUATION_FIELDS.items():
                 for batch_start in range(0, len(codes), BATCH_SIZE):
                     batch_end = min(batch_start + BATCH_SIZE, len(codes))
@@ -1110,6 +1332,45 @@ def main():
                         budget,
                     )
                     status_counts[status] = status_counts.get(status, 0) + 1
+
+        # 当年的结束日每天都会变。每个字段、每个股票批次从上次
+        # 成功区间的下一交易日续拉，避免每天重复申请年初至今的数据。
+        if not args.warmup_only:
+            for field_key, wind_field in DAILY_VALUATION_FIELDS.items():
+                for batch_start in range(0, len(codes), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(codes))
+                    last_success_date = latest_successful_daily_valuation_end(
+                        conn,
+                        field_key,
+                        batch_start,
+                        batch_end,
+                        current_year_start,
+                        end_date,
+                    )
+                    query_start = next_incremental_trading_date(
+                        last_success_date,
+                        current_year_start,
+                        current_year_trading_days,
+                    )
+                    if query_start is None or pd.Timestamp(query_start) > pd.Timestamp(end_date):
+                        status_counts["incremental_skip"] = (
+                            status_counts.get("incremental_skip", 0) + 1
+                        )
+                        continue
+                    status, _ = fetch_daily_valuation_field_batch(
+                        conn,
+                        codes,
+                        field_key,
+                        wind_field,
+                        query_start,
+                        end_date,
+                        batch_start,
+                        batch_end,
+                        budget,
+                    )
+                    status_counts[f"incremental_{status}"] = (
+                        status_counts.get(f"incremental_{status}", 0) + 1
+                    )
 
         for chunk_start, chunk_end in force_daily_valuation_chunks:
             for field_key, wind_field in DAILY_VALUATION_FIELDS.items():

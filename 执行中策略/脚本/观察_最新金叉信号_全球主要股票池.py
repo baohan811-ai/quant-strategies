@@ -21,7 +21,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(SCRIPT_DIR)
 REPO_DIR = os.path.dirname(BASE_DIR)
 CACHE_DIR = os.path.join(BASE_DIR, "缓存")
-OUTPUT_DIR = os.path.join(BASE_DIR, "输出")
+OUTPUT_DIR = os.path.join(BASE_DIR, "输出", "最新金叉信号")
 PAGES_DIR = os.path.join(REPO_DIR, "docs")
 PAGES_INDEX_FILE = os.path.join(PAGES_DIR, "index.html")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -162,17 +162,38 @@ def should_use_realtime(universe, latest_trading_date, now=None):
 
 
 def get_market_data_dates(universe, trading_dates, now=None):
-    latest_trading_date = trading_dates[-1]
     tz = ZoneInfo(universe["timezone"])
     now = now or datetime.now(tz)
     now = now.astimezone(tz) if now.tzinfo is not None else now.replace(tzinfo=tz)
+    local_date = now.strftime("%Y-%m-%d")
+
+    # 主程序使用上海日期作为 Wind 交易日历的查询终点。亚洲已进入下一天、
+    # 美洲仍停留在前一天时，日历末项可能是当地尚未到来的交易日，不能将其
+    # 当作已完成 EOD，否则会尝试拉取未来行情并得到 0 覆盖。
+    available_trading_dates = [
+        trade_date
+        for trade_date in trading_dates
+        if trade_date <= local_date
+    ]
+    if not available_trading_dates:
+        raise RuntimeError(
+            f"{universe['name']} 交易日历中没有不晚于当地日期 "
+            f"{local_date} 的交易日"
+        )
+    latest_trading_date = available_trading_dates[-1]
 
     eod_end_date = latest_trading_date
-    if now.strftime("%Y-%m-%d") == latest_trading_date:
+    if local_date == latest_trading_date:
         close_hour, close_minute = parse_hhmm(universe["market_close"])
         market_close = now.replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
-        if now < market_close and len(trading_dates) >= 2:
-            eod_end_date = trading_dates[-2]
+        if now < market_close:
+            completed_trading_dates = available_trading_dates[:-1]
+            if not completed_trading_dates:
+                raise RuntimeError(
+                    f"{universe['name']} 交易日历中没有早于当地未收盘交易日 "
+                    f"{local_date} 的日期"
+                )
+            eod_end_date = completed_trading_dates[-1]
 
     realtime_date = latest_trading_date if should_use_realtime(universe, latest_trading_date, now) else None
     return eod_end_date, realtime_date
@@ -354,6 +375,9 @@ def ensure_universe_local_db_updated(universe, codes, eod_end_date):
     cmd = [
         update_script,
         "--prices-from-wind",
+        # 只有覆盖不足才会走到这里；必须忽略历史 success 批次状态重拉，
+        # 否则盘前曾返回部分字段的批次会被永久跳过，无法自愈。
+        "--force-price-refresh",
         "--universe-name", universe["name"],
         "--sector-id", universe["sector_id"],
         "--end-date", eod_end_date,
@@ -417,7 +441,15 @@ def get_price_df_with_cache(universe, codes, field, start_date, end_date, realti
                 f"adjusted={universe.get('adjusted', 'F')}"
             )
             min_recent_coverage = max(1, int(len(codes) * 0.95))
-            recent_coverage = price_df.notna().sum(axis=1).tail(RECENT_REFRESH_DAYS)
+            # close 的任一历史断层都会让随后 60 个交易日无法计算 MA60。
+            # 因此覆盖检查必须至少包含“上一日 + MA60 窗口”，不能只看最近
+            # 10 行，否则较早的单日缺口会悄悄把金叉数量压成 0。
+            coverage_lookback_rows = (
+                max(RECENT_REFRESH_DAYS, MA_SLOW + 1)
+                if field == PRICE_FIELD
+                else RECENT_REFRESH_DAYS
+            )
+            recent_coverage = price_df.notna().sum(axis=1).tail(coverage_lookback_rows)
             low_coverage_dates = recent_coverage[recent_coverage < min_recent_coverage]
             if not low_coverage_dates.empty:
                 coverage_start = low_coverage_dates.index[0]

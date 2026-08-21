@@ -47,10 +47,7 @@ SIGNAL_MAX_DAILY_RETURN = 0.05
 LOOKBACK_DAYS = 1600
 TRADE_START_DATE = "2023-04-03"  # 必须写成字符串，例如 "2025-01-01"；None 表示沿用当前逻辑
 CACHE_PREFIX = "中证800"
-TUSHARE_TOKEN = os.environ.get(
-    "TUSHARE_TOKEN",
-    "b6e66f27e04e9dc7126d3bf2ec8ba33aba392f0cbad5c71fa6694c92",
-)
+TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
 TUSHARE_INDEX_CODE = "000906.SH"
 TUSHARE_API_URL = "http://api.tushare.pro"
 TUSHARE_SLEEP_SECONDS = 0.25
@@ -62,7 +59,13 @@ TUSHARE_INDEX_DAILY_CACHE = {}
 USE_HISTORICAL_CONSTITUENTS = True
 
 
+def require_tushare_token():
+    if not TUSHARE_TOKEN:
+        raise RuntimeError("未设置环境变量 TUSHARE_TOKEN")
+
+
 def tushare_query(api_name, params=None, fields=None, max_retry=3):
+    require_tushare_token()
     payload = {
         "api_name": api_name,
         "token": TUSHARE_TOKEN,
@@ -539,6 +542,7 @@ def fetch_tushare_realtime_snapshot(codes, trade_date, src="sina"):
         TUSHARE_REALTIME_CACHE[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
+    require_tushare_token()
     ts.set_token(TUSHARE_TOKEN)
     frames = []
     target_date_compact = pd.Timestamp(trade_date).strftime("%Y%m%d")
@@ -1456,7 +1460,7 @@ if not latest_low_efficiency_sell_plan_df.empty:
 # =========================
 # 20. 输出
 # =========================
-output_dir = os.path.join(BASE_DIR, "输出")
+output_dir = os.path.join(BASE_DIR, "输出", "金叉执行结果")
 os.makedirs(output_dir, exist_ok=True)
 output_file = os.path.join(output_dir, f"金叉买入_前高回撤10%卖出策略_中证800_Tushare版_{end_date}.xlsx")
 return_curve_image_file = os.path.join(output_dir, f"收益走势图_策略_vs_{benchmark_name}_Tushare版_{end_date}.png")

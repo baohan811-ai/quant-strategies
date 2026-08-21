@@ -9,7 +9,7 @@ from openpyxl.styles import Alignment, Border, Color, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 
-OUTPUT_DIR = Path(__file__).resolve().parents[1] / "输出"
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "输出" / "四大指数配置比较"
 
 INDEXES = ["沪深300", "中证500", "标普500", "纳斯达克100"]
 CODES = ["000300.SH", "000905.SH", "SPX.GI", "NDX.GI"]
@@ -20,8 +20,10 @@ MANUAL_INPUTS = {
     # 每月初更新时，Wind 能自动抓 A 股和指数行情估值；美股一致预期公开源不稳定，先在这里手工维护。
     "baseline_start_year": 2025,
     "current_year": 2026,
-    "us_profit_expectation_previous": {"SPX.GI": 0.2100, "NDX.GI": None},
-    "us_profit_expectation_latest": {"SPX.GI": 0.2260, "NDX.GI": 0.3030},
+    # 标普500：FactSet 2026-06-30 / 2026-07-31 的 CY2026 盈利增速预期。
+    # 纳斯达克100：30.3% 为 Nasdaq/Bloomberg 最新可核验公开值，未视为 2026-07-31 精确截面。
+    "us_profit_expectation_previous": {"SPX.GI": 0.2410, "NDX.GI": None},
+    "us_profit_expectation_latest": {"SPX.GI": 0.2910, "NDX.GI": 0.3030},
     "us_q1_profit_growth": {"SPX.GI": 0.2770, "NDX.GI": 0.5100},
     "non_operating_revenue_share": {"000300.SH": 0.40, "000905.SH": 0.10},
     "non_operating_profit_share": {"000300.SH": 0.60, "000905.SH": 0.16},
@@ -56,7 +58,7 @@ def month_label(d):
 
 
 def output_path(target_end):
-    return OUTPUT_DIR / f"四大指数配置可视化比较_截止{target_end.year}年{target_end.month}月底.xlsx"
+    return OUTPUT_DIR / f"四大指数配置可视化比较_截止{target_end.year}年{target_end.month}月{target_end.day}日.xlsx"
 
 
 def start_wind():
@@ -165,15 +167,171 @@ def fetch_wss_percent(w, codes, field, trade_date=None, rpt_date=None):
     return {code: (value / 100 if value is not None else None) for code, value in zip(codes, values)}
 
 
-def fetch_non_operating_weight(w, index_code, query_date):
-    constituent = w.wset(
+def as_date(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    for pattern in ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text[:10], pattern).date()
+        except ValueError:
+            continue
+    return None
+
+
+def fetch_index_constituents(w, index_code, query_date):
+    data = w.wset(
         "indexconstituent",
-        f"date={fmt_date(query_date)};windcode={index_code};field=wind_code,i_weight",
+        f"date={fmt_date(query_date)};windcode={index_code};field=wind_code,sec_name,i_weight",
     )
-    if constituent.ErrorCode != 0:
-        raise RuntimeError(f"Wind indexconstituent failed for {index_code}: {constituent.ErrorCode}")
-    codes = constituent.Data[0]
-    weights = constituent.Data[1]
+    if data.ErrorCode != 0:
+        raise RuntimeError(f"Wind indexconstituent failed for {index_code}: {data.ErrorCode}")
+    fields = {str(field).lower(): values for field, values in zip(data.Fields, data.Data)}
+    codes = fields.get("wind_code") or []
+    names = fields.get("sec_name") or [None] * len(codes)
+    weights = fields.get("i_weight") or [None] * len(codes)
+    rows = []
+    seen = set()
+    for code, name, weight in zip(codes, names, weights):
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        rows.append({"wind_code": code, "sec_name": name, "weight": weight})
+    return rows
+
+
+def fetch_wss_rows(w, codes, fields, options, batch_size=200):
+    rows = []
+    for start in range(0, len(codes), batch_size):
+        batch = codes[start:start + batch_size]
+        data = w.wss(batch, ",".join(fields), options)
+        if data.ErrorCode != 0:
+            raise RuntimeError(f"Wind wss {','.join(fields)} failed: {data.ErrorCode} {getattr(data, 'Data', None)}")
+        by_field = {str(field).lower(): values for field, values in zip(data.Fields, data.Data)}
+        for index, code in enumerate(batch):
+            row = {"wind_code": code}
+            for field in fields:
+                values = by_field.get(field.lower())
+                row[field] = values[index] if values is not None and index < len(values) else None
+            rows.append(row)
+    return rows
+
+
+def average_available(*values):
+    clean = [float(value) for value in values if value is not None]
+    return sum(clean) / len(clean) if clean else None
+
+
+def weighted_median(rows, value_key):
+    usable = [row for row in rows if row.get(value_key) is not None and row.get("weight") is not None]
+    total_weight = sum(float(row["weight"]) for row in usable)
+    if total_weight <= 0:
+        return None
+    threshold = total_weight / 2
+    running = 0.0
+    for row in sorted(usable, key=lambda item: float(item[value_key])):
+        running += float(row["weight"])
+        if running >= threshold:
+            return float(row[value_key])
+    return float(usable[-1][value_key])
+
+
+def fetch_h1_disclosure_snapshot(w, index_code, query_date, report_date):
+    constituents = fetch_index_constituents(w, index_code, query_date)
+    codes = [row["wind_code"] for row in constituents]
+    by_code = {row["wind_code"]: row for row in constituents}
+
+    actual_fields = ["stm_issuingdate", "yoynetprofit"]
+    actual_rows = fetch_wss_rows(
+        w,
+        codes,
+        actual_fields,
+        f"tradeDate={yyyymmdd(query_date)};rptDate={yyyymmdd(report_date)}",
+    )
+    notice_fields = [
+        "profitnotice_lastrptdate",
+        "profitnotice_date",
+        "profitnotice_style",
+        "profitnotice_changemin",
+        "profitnotice_changemax",
+    ]
+    notice_rows = fetch_wss_rows(w, codes, notice_fields, f"rptDate={yyyymmdd(report_date)}")
+
+    for item in actual_rows:
+        row = by_code[item["wind_code"]]
+        issuing_date = as_date(item.get("stm_issuingdate"))
+        is_actual = issuing_date is not None and issuing_date <= query_date
+        row["actual_date"] = issuing_date if is_actual else None
+        row["actual_yoy"] = item.get("yoynetprofit") / 100 if is_actual and item.get("yoynetprofit") is not None else None
+
+    for item in notice_rows:
+        row = by_code[item["wind_code"]]
+        notice_report_date = as_date(item.get("profitnotice_lastrptdate"))
+        notice_date = as_date(item.get("profitnotice_date"))
+        is_notice = notice_report_date == report_date and notice_date is not None and notice_date <= query_date
+        row["notice_date"] = notice_date if is_notice else None
+        row["notice_style"] = item.get("profitnotice_style") if is_notice else None
+        row["notice_yoy"] = (
+            average_available(item.get("profitnotice_changemin"), item.get("profitnotice_changemax")) / 100
+            if is_notice and average_available(item.get("profitnotice_changemin"), item.get("profitnotice_changemax")) is not None
+            else None
+        )
+
+    total_count = len(constituents)
+    total_weight = sum(float(row["weight"]) for row in constituents if row.get("weight") is not None)
+    notice_rows_all = [row for row in constituents if row.get("notice_date") is not None]
+    actual_rows_all = [row for row in constituents if row.get("actual_date") is not None]
+    combined_rows = []
+    for row in constituents:
+        if row.get("actual_yoy") is not None:
+            row["selected_source"] = "半年报实际"
+            row["selected_yoy"] = row["actual_yoy"]
+        elif row.get("notice_yoy") is not None:
+            row["selected_source"] = "业绩预告中值"
+            row["selected_yoy"] = row["notice_yoy"]
+        else:
+            row["selected_source"] = None
+            row["selected_yoy"] = None
+        if row["selected_yoy"] is not None:
+            combined_rows.append(row)
+
+    def coverage(rows):
+        count_rate = len(rows) / total_count if total_count else None
+        weight_rate = (
+            sum(float(row["weight"]) for row in rows if row.get("weight") is not None) / total_weight
+            if total_weight else None
+        )
+        return count_rate, weight_rate
+
+    notice_count_rate, notice_weight_rate = coverage(notice_rows_all)
+    actual_count_rate, actual_weight_rate = coverage(actual_rows_all)
+    combined_count_rate, combined_weight_rate = coverage(combined_rows)
+    return {
+        "constituents": constituents,
+        "total_count": total_count,
+        "notice_count": len(notice_rows_all),
+        "notice_count_rate": notice_count_rate,
+        "notice_weight_rate": notice_weight_rate,
+        "actual_count": len(actual_rows_all),
+        "actual_count_rate": actual_count_rate,
+        "actual_weight_rate": actual_weight_rate,
+        "combined_count": len(combined_rows),
+        "combined_count_rate": combined_count_rate,
+        "combined_weight_rate": combined_weight_rate,
+        "notice_yoy_weighted_median": weighted_median(notice_rows_all, "notice_yoy"),
+        "actual_yoy_weighted_median": weighted_median(actual_rows_all, "actual_yoy"),
+        "combined_yoy_weighted_median": weighted_median(combined_rows, "selected_yoy"),
+    }
+
+
+def fetch_non_operating_weight(w, index_code, query_date):
+    constituent = fetch_index_constituents(w, index_code, query_date)
+    codes = [row["wind_code"] for row in constituent]
+    weights = [row["weight"] for row in constituent]
     total = 0
     for start in range(0, len(codes), 200):
         batch_codes = codes[start:start + 200]
@@ -192,26 +350,26 @@ def fetch_market_snapshot(w, target_end, previous_end):
     current_year = MANUAL_INPUTS["current_year"]
     baseline_end = last_trading_day_of_month(w, base_year - 1, 12)
     current_year_start_base = last_trading_day_of_month(w, current_year - 1, 12)
-    same_month_last_year = last_trading_day_of_month(w, target_end.year - 1, target_end.month)
     ten_year_start = target_end - timedelta(days=3653)
 
     close_target = value_on(w, CODES, "close", target_end)
     close_previous = value_on(w, CODES, "close", previous_end)
     close_baseline = value_on(w, CODES, "close", baseline_end)
     close_current_year_base = value_on(w, CODES, "close", current_year_start_base)
-    close_same_month_last_year = value_on(w, CODES, "close", same_month_last_year)
 
     pe_target = value_on(w, CODES, "pe_ttm", target_end)
     pe_previous = value_on(w, CODES, "pe_ttm", previous_end)
-    pe_baseline = value_on(w, CODES, "pe_ttm", baseline_end)
-    pe_current_year_base = value_on(w, CODES, "pe_ttm", current_year_start_base)
-    pe_same_month_last_year = value_on(w, CODES, "pe_ttm", same_month_last_year)
     pe_history = fetch_wsd_series(w, CODES, "pe_ttm", ten_year_start, target_end)
 
     expected_previous = fetch_wss_percent(w, A_SHARE_CODES, "west_netprofit_yoy", trade_date=previous_end)
     expected_latest = fetch_wss_percent(w, A_SHARE_CODES, "west_netprofit_yoy", trade_date=target_end)
     q1_report_date = date(current_year, 3, 31)
     q1_profit_growth = fetch_wss_percent(w, A_SHARE_CODES, "yoynetprofit", trade_date=target_end, rpt_date=q1_report_date)
+    h1_report_date = date(current_year, 6, 30)
+    h1_disclosures = {
+        code: fetch_h1_disclosure_snapshot(w, code, target_end, h1_report_date)
+        for code in A_SHARE_CODES
+    }
 
     non_op_previous = {code: fetch_non_operating_weight(w, code, previous_end) for code in A_SHARE_CODES}
     non_op_latest = {code: fetch_non_operating_weight(w, code, target_end) for code in A_SHARE_CODES}
@@ -219,10 +377,6 @@ def fetch_market_snapshot(w, target_end, previous_end):
     rows_by_code = {}
     for code in CODES:
         pe_values = [value for _, value in pe_history[code] if value is not None]
-        target_earnings = implied_earnings(close_target[code], pe_target[code])
-        baseline_earnings = implied_earnings(close_baseline[code], pe_baseline[code])
-        current_year_base_earnings = implied_earnings(close_current_year_base[code], pe_current_year_base[code])
-        same_month_earnings = implied_earnings(close_same_month_last_year[code], pe_same_month_last_year[code])
         rows_by_code[code] = {
             "close": close_target[code],
             "previous_close": close_previous[code],
@@ -231,8 +385,6 @@ def fetch_market_snapshot(w, target_end, previous_end):
             "previous_baseline_return": pct_change(close_previous[code], close_baseline[code]),
             "baseline_return": pct_change(close_target[code], close_baseline[code]),
             "current_year_return": pct_change(close_target[code], close_current_year_base[code]),
-            "baseline_earnings_growth": pct_change(current_year_base_earnings, baseline_earnings),
-            "ttm_earnings_yoy": pct_change(target_earnings, same_month_earnings),
             "pe_p25": percentile(pe_values, 0.25),
             "pe_median": percentile(pe_values, 0.50),
             "pe_p75": percentile(pe_values, 0.75),
@@ -243,6 +395,11 @@ def fetch_market_snapshot(w, target_end, previous_end):
         rows_by_code[code]["expected_previous"] = expected_previous.get(code)
         rows_by_code[code]["expected_latest"] = expected_latest.get(code)
         rows_by_code[code]["q1_profit_growth"] = q1_profit_growth.get(code)
+        rows_by_code[code]["h1_notice_yoy_weighted_median"] = h1_disclosures[code]["notice_yoy_weighted_median"]
+        rows_by_code[code]["h1_actual_yoy_weighted_median"] = h1_disclosures[code]["actual_yoy_weighted_median"]
+        rows_by_code[code]["h1_combined_yoy_weighted_median"] = h1_disclosures[code]["combined_yoy_weighted_median"]
+        rows_by_code[code]["h1_notice_count_rate"] = h1_disclosures[code]["notice_count_rate"]
+        rows_by_code[code]["h1_actual_count_rate"] = h1_disclosures[code]["actual_count_rate"]
         rows_by_code[code]["non_op_previous"] = non_op_previous.get(code)
         rows_by_code[code]["non_op_latest"] = non_op_latest.get(code)
 
@@ -250,6 +407,11 @@ def fetch_market_snapshot(w, target_end, previous_end):
         rows_by_code[code]["expected_previous"] = MANUAL_INPUTS["us_profit_expectation_previous"].get(code)
         rows_by_code[code]["expected_latest"] = MANUAL_INPUTS["us_profit_expectation_latest"].get(code)
         rows_by_code[code]["q1_profit_growth"] = MANUAL_INPUTS["us_q1_profit_growth"].get(code)
+        rows_by_code[code]["h1_notice_yoy_weighted_median"] = None
+        rows_by_code[code]["h1_actual_yoy_weighted_median"] = None
+        rows_by_code[code]["h1_combined_yoy_weighted_median"] = None
+        rows_by_code[code]["h1_notice_count_rate"] = None
+        rows_by_code[code]["h1_actual_count_rate"] = None
         rows_by_code[code]["non_op_previous"] = None
         rows_by_code[code]["non_op_latest"] = None
 
@@ -258,7 +420,8 @@ def fetch_market_snapshot(w, target_end, previous_end):
         "previous_end": previous_end,
         "baseline_end": baseline_end,
         "current_year_start_base": current_year_start_base,
-        "same_month_last_year": same_month_last_year,
+        "h1_report_date": h1_report_date,
+        "h1_disclosures": h1_disclosures,
         "rows_by_code": rows_by_code,
     }
 
@@ -280,9 +443,12 @@ def build_rows(snapshot):
         ("行情截至日期", *[fmt_date(target_end)] * 4, "Wind；月末最后交易日"),
         (f"{base_year}年至今涨幅", *values_for_codes(rows_by_code, "baseline_return"), f"Wind close；相对 {fmt_date(snapshot['baseline_end'])}"),
         (f"{current_year}年初至今涨幅", *values_for_codes(rows_by_code, "current_year_return"), f"Wind close；相对 {fmt_date(snapshot['current_year_start_base'])}"),
-        (f"{base_year}年滚动盈利增长", *values_for_codes(rows_by_code, "baseline_earnings_growth"), "由指数点位 / PE_TTM 反推"),
-        (f"截止{target_label}滚动盈利同比", *values_for_codes(rows_by_code, "ttm_earnings_yoy"), f"由指数点位 / PE_TTM 反推；对比 {fmt_date(snapshot['same_month_last_year'])}"),
         (f"{current_year}年Q1利润增速", *values_for_codes(rows_by_code, "q1_profit_growth"), "A股：Wind YOYNETPROFIT；标普500/纳斯达克100：手工输入公开资料"),
+        (f"{current_year}H1业绩预告利润增速（预告样本权重中位数）", *values_for_codes(rows_by_code, "h1_notice_yoy_weighted_median"), "A股：H1业绩预告同比区间中值的指数权重加权中位数；仅含出具预告的公司"),
+        (f"{current_year}H1业绩预告公司覆盖率", *values_for_codes(rows_by_code, "h1_notice_count_rate"), "A股：有H1业绩预告的成分股数 ÷ 月末历史成分股数；与正式半年报可重叠"),
+        (f"{current_year}H1半年报实际利润增速（已披露样本权重中位数）", *values_for_codes(rows_by_code, "h1_actual_yoy_weighted_median"), "A股：正式半年报 YOYNETPROFIT 的指数权重加权中位数；仅含截至日已披露公司"),
+        (f"{current_year}H1实际业绩公司覆盖率", *values_for_codes(rows_by_code, "h1_actual_count_rate"), "A股：截至日已披露正式半年报的成分股数 ÷ 月末历史成分股数"),
+        (f"{current_year}H1同口径利润增速（实际优先权重中位数）", *values_for_codes(rows_by_code, "h1_combined_yoy_weighted_median"), "A股：正式半年报优先，其余采用业绩预告同比区间中值；汇总采用指数权重加权中位数"),
         (f"{current_year}年利润增速预期：截止{previous_label}", *values_for_codes(rows_by_code, "expected_previous"), "A股：Wind west_netprofit_yoy；美股：手工输入公开资料"),
         (f"{current_year}年利润增速预期：截止{target_label}", *values_for_codes(rows_by_code, "expected_latest"), "A股：Wind west_netprofit_yoy；美股：手工输入公开资料"),
         (f"{current_year}年利润增速预期变动", None, None, None, None, f"公式：截止{target_label}减截止{previous_label}"),
@@ -313,6 +479,7 @@ PERCENT_KEYWORDS = (
     "收入占比",
     "利润占比",
     "十年分位",
+    "覆盖率",
 )
 
 
@@ -370,7 +537,10 @@ def style_summary_sections(ws, labels):
     category_rows = {
         "basic": {label for label in label_names if label in {"指数代码", "行情截至日期"}},
         "return": {label for label in label_names if "涨幅" in label},
-        "profit": {label for label in label_names if "滚动盈利" in label or "利润增速" in label},
+        "profit": {
+            label for label in label_names
+            if "滚动盈利" in label or "利润增速" in label or "覆盖率" in label
+        },
         "non_operating": {
             label for label in label_names
             if "非实业" in label or label in {"假设非实业利润增速", "加权后预期利润增速"}
@@ -387,6 +557,8 @@ def style_summary_sections(ws, labels):
             section_starts.add(label)
         if "Q1利润增速" in label:
             section_starts.add(label)
+        if "H1业绩预告利润增速" in label:
+            section_starts.add(label)
         if label.startswith("非实业权重："):
             section_starts.add(label)
         if "PE_TTM" in label:
@@ -401,6 +573,10 @@ def style_summary_sections(ws, labels):
     }
     key_rows.update({label for label in label_names if "利润增速预期：截止" in label and "变动" not in label})
     key_rows.update({label for label in label_names if "PE 十年分位" in label})
+    key_rows.update({
+        label for label in label_names
+        if "H1业绩预告利润增速" in label or "H1半年报实际利润增速" in label
+    })
     for category, row_labels in category_rows.items():
         fill = category_fills[category]
         for label in row_labels:
@@ -458,8 +634,9 @@ def add_bar_chart(ws, source_ws, title, rows, anchor, y_title):
     chart.title = title
     chart.y_axis.title = y_title
     chart.x_axis.title = "指数"
-    data = Reference(source_ws, min_col=1, max_col=5, min_row=rows[0], max_row=rows[-1])
-    chart.add_data(data, titles_from_data=True, from_rows=True)
+    for row in rows:
+        data = Reference(source_ws, min_col=1, max_col=5, min_row=row, max_row=row)
+        chart.add_data(data, titles_from_data=True, from_rows=True)
     chart.set_categories(Reference(source_ws, min_col=2, max_col=5, min_row=1, max_row=1))
     chart.height = 7.2
     chart.width = 13.5
@@ -586,11 +763,18 @@ def build(snapshot):
 
     baseline_return_label = find_label(labels, lambda label: "年至今涨幅" in label and "年初" not in label)
     current_return_label = find_label(labels, lambda label: "年初至今涨幅" in label)
-    baseline_earnings_label = find_label(labels, lambda label: "滚动盈利增长" in label)
-    ttm_earnings_label = find_label(labels, lambda label: "滚动盈利同比" in label)
+    h1_notice_count_label = find_label(labels, lambda label: "H1业绩预告公司覆盖率" in label)
+    h1_actual_count_label = find_label(labels, lambda label: "H1实际业绩公司覆盖率" in label)
     add_bar_chart(visual, summary, "指数涨幅比较", [labels[baseline_return_label], labels[current_return_label]], "A4", "涨幅")
     add_bar_chart(visual, summary, f"截止{month_label(snapshot['target_end'])} PE 与过去十年中位数", [labels[pe_ttm_label], labels["过去十年估值中位数"]], "J4", "PE_TTM")
-    add_bar_chart(visual, summary, "滚动盈利增长比较", [labels[baseline_earnings_label], labels[ttm_earnings_label]], "A19", "盈利增长")
+    add_bar_chart(
+        visual,
+        summary,
+        f"{MANUAL_INPUTS['current_year']}H1业绩披露公司覆盖率",
+        [labels[h1_notice_count_label], labels[h1_actual_count_label]],
+        "A19",
+        "覆盖率",
+    )
 
     previous_label = month_label(snapshot["previous_end"])
     target_label = month_label(snapshot["target_end"])
@@ -663,9 +847,13 @@ def build(snapshot):
         ("非实业定义", "金融、能源、房地产三个板块。"),
         ("市场数据", f"指数点位、PE_TTM、过去十年估值分位来自 WindPy；四个指数均使用 {fmt_date(snapshot['target_end'])} 收盘，即月末最后交易日。"),
         (f"{MANUAL_INPUTS['current_year']}年Q1利润增速", "沪深300和中证500使用 Wind 指数级字段 YOYNETPROFIT，按一季报 rptDate 获取报告期净利润同比增速。标普500和纳斯达克100使用脚本顶部手工输入区。"),
+        (f"{MANUAL_INPUTS['current_year']}H1同口径利润增速", f"只比较报告期为 {fmt_date(snapshot['h1_report_date'])} 的数据。正式半年报使用 YOYNETPROFIT；尚未披露正式半年报的公司可使用 H1 业绩预告同比上下限中值。按 {fmt_date(snapshot['target_end'])} 的历史成分股及指数权重计算加权中位数，正式半年报优先覆盖同公司的预告。采用中位数是为了避免扭亏、微基数导致的数千倍同比支配结果；该指标不等同于完整指数归母净利润总额同比。"),
+        ("H1业绩预告公司覆盖率", "有对应H1业绩预告的成分股数 ÷ 月末历史成分股数。公司后续披露正式半年报后，仍保留其曾出具预告的统计事实。"),
+        ("H1实际业绩公司覆盖率", "仅以 Wind STM_ISSUINGDATE 不晚于统计截止日的正式半年报计入实际业绩；覆盖率 = 已披露正式半年报的成分股数 ÷ 月末历史成分股数。"),
         ("利润增速预期", f"沪深300和中证500使用 Wind 指数级字段 west_netprofit_yoy，分别按 tradeDate={yyyymmdd(snapshot['previous_end'])} 和 tradeDate={yyyymmdd(snapshot['target_end'])} 获取 FY1 一致预期净利润增速及其变动。美股使用脚本顶部手工输入区。"),
+        ("美股利润数据来源", "标普500：FactSet Q2 2026 Earnings Preview（6月底CY2026预期24.1%）https://insight.factset.com/sp-500-earnings-season-preview-q2-2026 ；FactSet Earnings Season Update 2026-07-31（CY2026预期29.1%）https://insight.factset.com/sp-500-earnings-season-update-july-31-2026 。纳斯达克100：Nasdaq Global Indexes公开研究；30.3%为最新可核验公开值，未视为7月31日精确截面。"),
         ("手工输入项", "美股利润增速预期、非实业收入占比、非实业利润占比、剔除后 PE、假设非实业利润增速、建议配置在脚本顶部 MANUAL_INPUTS 中维护。"),
-        ("盈利增长", f"{MANUAL_INPUTS['baseline_start_year']} 年滚动盈利增长和截止{target_label}滚动盈利同比由指数点位 / PE_TTM 反推，用作指数整体盈利变化的近似观察。"),
+        ("已删除旧滚动盈利反推", "不再用指数点位 ÷ PE_TTM 推算滚动盈利同比，因为不同月份的 PE_TTM 可能对应不同财报窗口，会把不同报告期混在一起比较。"),
         ("剔除非实业后利润增速", "A 股使用公式动态计算：(指数整体利润增速 - 非实业利润占比 × 假设非实业利润增速) ÷ (1 - 非实业利润占比)。"),
         (f"截止{target_label}非实业权重", "沪深300和中证500使用 Wind 月末成分权重，按万得一级行业汇总金融、能源、房地产。美股留空。"),
         ("空白单元格", "表示 Wind 本次未能按统一口径取得，且手工输入区未提供，不进行推测填充。"),
@@ -686,9 +874,12 @@ def build(snapshot):
         "指数", "代码", "行情日期", "收盘点位", "PE_TTM",
         f"{MANUAL_INPUTS['baseline_start_year']}年至今",
         f"{MANUAL_INPUTS['current_year']}年初至今",
-        f"{MANUAL_INPUTS['baseline_start_year']}滚动盈利增长",
-        f"截止{target_label}滚动盈利同比",
         f"{MANUAL_INPUTS['current_year']}年Q1利润增速",
+        f"{MANUAL_INPUTS['current_year']}H1业绩预告利润增速（预告样本权重中位数）",
+        f"{MANUAL_INPUTS['current_year']}H1半年报实际利润增速（已披露样本权重中位数）",
+        f"{MANUAL_INPUTS['current_year']}H1同口径利润增速（实际优先权重中位数）",
+        "H1业绩预告公司覆盖率",
+        "H1实际业绩公司覆盖率",
         "PE十年分位",
         f"截止{previous_label}利润增速预期",
         f"截止{target_label}利润增速预期",
@@ -704,30 +895,70 @@ def build(snapshot):
             row.get("pe"),
             row.get("baseline_return"),
             row.get("current_year_return"),
-            row.get("baseline_earnings_growth"),
-            row.get("ttm_earnings_yoy"),
             row.get("q1_profit_growth"),
+            row.get("h1_notice_yoy_weighted_median"),
+            row.get("h1_actual_yoy_weighted_median"),
+            row.get("h1_combined_yoy_weighted_median"),
+            row.get("h1_notice_count_rate"),
+            row.get("h1_actual_count_rate"),
             row.get("pe_rank"),
             row.get("expected_previous"),
             row.get("expected_latest"),
         ))
     for row in raw_rows:
         raw.append(row)
-    style_header(raw, 1, 1, 13)
-    apply_grid(raw, 1, raw.max_row, 1, 13)
+    raw_max_col = raw.max_column
+    style_header(raw, 1, 1, raw_max_col)
+    apply_grid(raw, 1, raw.max_row, 1, raw_max_col)
     raw.sheet_view.showGridLines = False
     raw.sheet_properties.tabColor = "9AA9B7"
     for row in range(2, raw.max_row + 1):
         raw.cell(row, 1).fill = PatternFill("solid", fgColor="F4F7FA")
         raw.cell(row, 1).font = Font(bold=True, color="1F2937")
         if row % 2 == 0:
-            for col in range(2, 14):
+            for col in range(2, raw_max_col + 1):
                 raw.cell(row, col).fill = PatternFill("solid", fgColor="FBFCFE")
-    for col in range(1, 14):
+    for col in range(1, raw_max_col + 1):
         raw.column_dimensions[get_column_letter(col)].width = 18
     for row in range(2, raw.max_row + 1):
-        for col in range(6, 14):
+        for col in range(6, raw_max_col + 1):
             raw.cell(row, col).number_format = "0.0%"
+
+    disclosure = wb.create_sheet("A股H1披露明细")
+    disclosure.append([
+        "指数", "代码", "名称", "月末权重", "业绩预告披露日", "预告类型", "预告同比中值",
+        "正式半年报披露日", "半年报实际同比", "实际优先采用来源", "实际优先H1同比",
+    ])
+    for index_name, index_code in zip(INDEXES[:2], A_SHARE_CODES):
+        stats = snapshot["h1_disclosures"][index_code]
+        for item in stats["constituents"]:
+            disclosure.append([
+                index_name,
+                item.get("wind_code"),
+                item.get("sec_name"),
+                item.get("weight") / 100 if item.get("weight") is not None else None,
+                item.get("notice_date"),
+                item.get("notice_style"),
+                item.get("notice_yoy"),
+                item.get("actual_date"),
+                item.get("actual_yoy"),
+                item.get("selected_source"),
+                item.get("selected_yoy"),
+            ])
+    style_header(disclosure, 1, 1, disclosure.max_column)
+    apply_grid(disclosure, 1, disclosure.max_row, 1, disclosure.max_column)
+    disclosure.sheet_view.showGridLines = False
+    disclosure.sheet_properties.tabColor = "70AD47"
+    disclosure.freeze_panes = "A2"
+    disclosure.auto_filter.ref = f"A1:K{disclosure.max_row}"
+    widths = [12, 14, 16, 12, 16, 14, 14, 18, 16, 18, 16]
+    for col, width in enumerate(widths, 1):
+        disclosure.column_dimensions[get_column_letter(col)].width = width
+    for row in range(2, disclosure.max_row + 1):
+        for col in (4, 7, 9, 11):
+            disclosure.cell(row, col).number_format = "0.0%"
+        for col in (5, 8):
+            disclosure.cell(row, col).number_format = "yyyy-mm-dd"
 
     output = output_path(snapshot["target_end"])
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -737,7 +968,7 @@ def build(snapshot):
 
     # Reload once to catch malformed formulas, relationships, or chart serialization.
     checked = load_workbook(output, data_only=False)
-    assert checked.sheetnames == ["配置比较", "可视化", f"截止{previous_label}与{target_label}比较", "口径说明", "原始数据"]
+    assert checked.sheetnames == ["配置比较", "可视化", f"截止{previous_label}与{target_label}比较", "口径说明", "原始数据", "A股H1披露明细"]
     assert checked["配置比较"]["B2"].value == "000300.SH"
     print(output)
     return output

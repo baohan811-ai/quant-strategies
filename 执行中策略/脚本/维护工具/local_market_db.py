@@ -14,7 +14,7 @@ CACHE_DIR = os.path.join(BASE_DIR, "缓存")
 MARKET_DB_PATH = os.path.join(CACHE_DIR, "本地行情数据库.sqlite3")
 A_SHARE_FUNDAMENTAL_DB_PATH = os.path.join(CACHE_DIR, "全部A股_基础基本面.sqlite3")
 
-PRICE_FIELDS = {"open", "high", "low", "close", "volume", "amt", "turn"}
+PRICE_FIELDS = {"open", "high", "low", "close", "volume", "amt", "turn", "free_turn"}
 FUNDAMENTAL_FIELDS = {"pe_ttm", "pb_lf", "roe_ttm", "debt_to_assets"}
 A_SHARE_SECTOR_ID = "a001010100000000"
 DEFAULT_DAILY_PRICE_FIELDS = ["open", "high", "low", "close", "volume", "amt"]
@@ -43,11 +43,17 @@ def init_market_db(db_path=MARKET_DB_PATH):
                 volume REAL,
                 amt REAL,
                 turn REAL,
+                free_turn REAL,
                 adjusted TEXT NOT NULL DEFAULT 'F',
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (trade_date, wind_code, adjusted)
             )
         """)
+        existing_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(daily_prices)").fetchall()
+        }
+        if "free_turn" not in existing_columns:
+            conn.execute("ALTER TABLE daily_prices ADD COLUMN free_turn REAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_universe (
                 universe_name TEXT NOT NULL,
@@ -78,6 +84,43 @@ def init_market_db(db_path=MARKET_DB_PATH):
                 source_options TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (classification_system, wind_code)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS stock_industry_snapshot (
+                snapshot_date TEXT NOT NULL,
+                classification_system TEXT NOT NULL,
+                universe_name TEXT NOT NULL,
+                wind_code TEXT NOT NULL,
+                sec_name TEXT,
+                industry_level1 TEXT,
+                source_field TEXT NOT NULL,
+                source_options TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    snapshot_date,
+                    classification_system,
+                    universe_name,
+                    wind_code
+                )
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS index_industry_weight_snapshot (
+                snapshot_date TEXT NOT NULL,
+                index_code TEXT NOT NULL,
+                classification_system TEXT NOT NULL,
+                industry_level1 TEXT NOT NULL,
+                industry_weight REAL NOT NULL,
+                constituent_count INTEGER NOT NULL,
+                source_field TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    snapshot_date,
+                    index_code,
+                    classification_system,
+                    industry_level1
+                )
             )
         """)
         conn.execute("""
@@ -115,10 +158,36 @@ def init_market_db(db_path=MARKET_DB_PATH):
             ON stock_industry (classification_system, industry_level1)
         """)
         conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_industry_snapshot_lookup
+            ON stock_industry_snapshot (
+                universe_name,
+                classification_system,
+                snapshot_date,
+                wind_code
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_index_industry_weight_lookup
+            ON index_industry_weight_snapshot (
+                index_code,
+                classification_system,
+                snapshot_date
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_industry_snapshot_level1
+            ON stock_industry_snapshot (
+                universe_name,
+                classification_system,
+                snapshot_date,
+                industry_level1
+            )
+        """)
+        conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_universe_constituents_snapshot_universe_date
             ON universe_constituents_snapshot (universe_name, snapshot_date)
         """)
-        _set_metadata(conn, "schema_version", "2")
+        _set_metadata(conn, "schema_version", "3")
         conn.commit()
 
 
@@ -136,6 +205,341 @@ def get_latest_price_date(db_path=MARKET_DB_PATH, adjusted="F"):
               AND {complete_conditions}
         """, (adjusted,)).fetchone()
     return row[0] if row and row[0] else None
+
+
+def load_stock_industry_snapshots(
+    universe_name,
+    start_date,
+    end_date,
+    classification_system=WIND_LEVEL1_INDUSTRY_SYSTEM,
+    db_path=MARKET_DB_PATH,
+    include_prior=True,
+):
+    if not os.path.exists(db_path):
+        return pd.DataFrame(
+            columns=[
+                "snapshot_date",
+                "wind_code",
+                "sec_name",
+                "industry_level1",
+            ]
+        )
+
+    frames = []
+    with sqlite3.connect(db_path) as conn:
+        if include_prior:
+            prior = pd.read_sql_query(
+                """
+                SELECT snapshot_date, wind_code, sec_name, industry_level1
+                FROM stock_industry_snapshot
+                WHERE universe_name = ?
+                  AND classification_system = ?
+                  AND snapshot_date = (
+                      SELECT MAX(snapshot_date)
+                      FROM stock_industry_snapshot
+                      WHERE universe_name = ?
+                        AND classification_system = ?
+                        AND snapshot_date < ?
+                  )
+                """,
+                conn,
+                params=[
+                    universe_name,
+                    classification_system,
+                    universe_name,
+                    classification_system,
+                    start_date,
+                ],
+            )
+            frames.append(prior)
+
+        in_range = pd.read_sql_query(
+            """
+            SELECT snapshot_date, wind_code, sec_name, industry_level1
+            FROM stock_industry_snapshot
+            WHERE universe_name = ?
+              AND classification_system = ?
+              AND snapshot_date >= ?
+              AND snapshot_date <= ?
+            ORDER BY snapshot_date, wind_code
+            """,
+            conn,
+            params=[
+                universe_name,
+                classification_system,
+                start_date,
+                end_date,
+            ],
+        )
+        frames.append(in_range)
+
+    snapshots = pd.concat(frames, ignore_index=True)
+    if snapshots.empty:
+        return snapshots
+    snapshots["snapshot_date"] = pd.to_datetime(snapshots["snapshot_date"])
+    return (
+        snapshots
+        .drop_duplicates(["snapshot_date", "wind_code"], keep="last")
+        .sort_values(["snapshot_date", "wind_code"])
+        .reset_index(drop=True)
+    )
+
+
+def get_latest_universe_constituent_snapshot(
+    universe_name,
+    on_or_before=None,
+    db_path=MARKET_DB_PATH,
+):
+    if not os.path.exists(db_path):
+        return None, pd.DataFrame(columns=["wind_code", "sec_name"])
+
+    conditions = ["universe_name = ?"]
+    params = [universe_name]
+    if on_or_before is not None:
+        conditions.append("snapshot_date <= ?")
+        params.append(pd.Timestamp(on_or_before).strftime("%Y-%m-%d"))
+
+    where_clause = " AND ".join(conditions)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            f"""
+            SELECT MAX(snapshot_date)
+            FROM universe_constituents_snapshot
+            WHERE {where_clause}
+            """,
+            params,
+        ).fetchone()
+        snapshot_date = row[0] if row and row[0] else None
+        if snapshot_date is None:
+            return None, pd.DataFrame(columns=["wind_code", "sec_name"])
+        snapshot = pd.read_sql_query(
+            """
+            SELECT wind_code, sec_name
+            FROM universe_constituents_snapshot
+            WHERE universe_name = ?
+              AND snapshot_date = ?
+            ORDER BY wind_code
+            """,
+            conn,
+            params=[universe_name, snapshot_date],
+        )
+    return snapshot_date, snapshot
+
+
+def save_universe_constituent_snapshot(
+    universe_name,
+    sector_id,
+    snapshot_date,
+    snapshot_df,
+    db_path=MARKET_DB_PATH,
+):
+    required_columns = {"wind_code", "sec_name"}
+    missing_columns = required_columns.difference(snapshot_df.columns)
+    if missing_columns:
+        raise ValueError(f"成分快照缺少字段: {sorted(missing_columns)}")
+
+    snapshot_date = pd.Timestamp(snapshot_date).strftime("%Y-%m-%d")
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = [
+        (
+            snapshot_date,
+            universe_name,
+            sector_id,
+            row.wind_code,
+            row.sec_name,
+            updated_at,
+        )
+        for row in snapshot_df.itertuples(index=False)
+    ]
+    with connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO universe_constituents_snapshot (
+                snapshot_date,
+                universe_name,
+                sector_id,
+                wind_code,
+                sec_name,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_date, universe_name, wind_code) DO UPDATE SET
+                sector_id = excluded.sector_id,
+                sec_name = excluded.sec_name,
+                updated_at = excluded.updated_at
+            """,
+            rows,
+        )
+        conn.commit()
+    return len(rows)
+
+
+def fetch_wind_sector_constituents(
+    wind_client,
+    sector_id,
+    query_date=None,
+):
+    options = f"sectorid={sector_id}"
+    if query_date is not None:
+        options = (
+            f"date={pd.Timestamp(query_date).strftime('%Y-%m-%d')};"
+            f"sectorid={sector_id}"
+        )
+    data = wind_client.wset("sectorconstituent", options)
+    if data.ErrorCode != 0 or not data.Data:
+        raise RuntimeError(
+            f"成分股拉取失败: date={query_date or 'current'}, "
+            f"sector_id={sector_id}, ErrorCode={data.ErrorCode}"
+        )
+    field_map = {str(field).lower(): idx for idx, field in enumerate(data.Fields)}
+    code_idx = field_map.get("wind_code")
+    name_idx = field_map.get("sec_name")
+    if code_idx is None or name_idx is None:
+        raise RuntimeError(f"成分股返回字段异常: {data.Fields}")
+    snapshot = pd.DataFrame(
+        {
+            "wind_code": data.Data[code_idx],
+            "sec_name": data.Data[name_idx],
+        }
+    )
+    return (
+        snapshot
+        .dropna(subset=["wind_code"])
+        .drop_duplicates("wind_code", keep="last")
+        .sort_values("wind_code")
+        .reset_index(drop=True)
+    )
+
+
+def ensure_universe_constituents_current(
+    wind_client,
+    universe_name,
+    sector_id,
+    target_date,
+    current_snapshot=None,
+    expected_count=None,
+    db_path=MARKET_DB_PATH,
+):
+    target_date = pd.Timestamp(target_date).strftime("%Y-%m-%d")
+    current_snapshot = (
+        current_snapshot.copy()
+        if current_snapshot is not None
+        else fetch_wind_sector_constituents(wind_client, sector_id)
+    )
+    current_snapshot = (
+        current_snapshot
+        .dropna(subset=["wind_code"])
+        .drop_duplicates("wind_code", keep="last")
+        .sort_values("wind_code")
+        .reset_index(drop=True)
+    )
+    if expected_count is not None and len(current_snapshot) != expected_count:
+        raise RuntimeError(
+            f"{universe_name} 当前成分数量异常："
+            f"{len(current_snapshot)}，预期 {expected_count}"
+        )
+
+    latest_date, latest_snapshot = get_latest_universe_constituent_snapshot(
+        universe_name,
+        on_or_before=target_date,
+        db_path=db_path,
+    )
+    current_codes = set(current_snapshot["wind_code"])
+    latest_codes = set(latest_snapshot["wind_code"])
+    result = {
+        "target_date": target_date,
+        "latest_snapshot_before_check": latest_date,
+        "latest_snapshot_after_check": latest_date,
+        "status": "matched",
+        "current_count": len(current_snapshot),
+        "added_count": len(current_codes - latest_codes),
+        "removed_count": len(latest_codes - current_codes),
+        "written_change_dates": [],
+    }
+
+    if latest_date is None:
+        save_universe_constituent_snapshot(
+            universe_name,
+            sector_id,
+            target_date,
+            current_snapshot,
+            db_path=db_path,
+        )
+        result.update(
+            {
+                "status": "initialized",
+                "latest_snapshot_after_check": target_date,
+                "written_change_dates": [target_date],
+            }
+        )
+        return result
+
+    if latest_codes == current_codes:
+        return result
+
+    trading_data = wind_client.tdays(
+        (pd.Timestamp(latest_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+        target_date,
+        "",
+    )
+    if (
+        trading_data.ErrorCode != 0
+        or not trading_data.Data
+        or len(trading_data.Data[0]) == 0
+    ):
+        raise RuntimeError(
+            f"无法定位 {universe_name} 成分变化生效日："
+            f"{latest_date} ~ {target_date}, ErrorCode={trading_data.ErrorCode}"
+        )
+
+    previous_codes = latest_codes
+    written_change_dates = []
+    last_scanned_snapshot = latest_snapshot
+    for trade_date in pd.to_datetime(trading_data.Data[0]):
+        trade_date_text = trade_date.strftime("%Y-%m-%d")
+        daily_snapshot = fetch_wind_sector_constituents(
+            wind_client,
+            sector_id,
+            query_date=trade_date_text,
+        )
+        daily_codes = set(daily_snapshot["wind_code"])
+        if expected_count is not None and len(daily_snapshot) != expected_count:
+            raise RuntimeError(
+                f"{universe_name} {trade_date_text} 成分数量异常："
+                f"{len(daily_snapshot)}，预期 {expected_count}"
+            )
+        if daily_codes != previous_codes:
+            save_universe_constituent_snapshot(
+                universe_name,
+                sector_id,
+                trade_date_text,
+                daily_snapshot,
+                db_path=db_path,
+            )
+            written_change_dates.append(trade_date_text)
+            previous_codes = daily_codes
+        last_scanned_snapshot = daily_snapshot
+
+    scanned_codes = set(last_scanned_snapshot["wind_code"])
+    if scanned_codes != current_codes:
+        raise RuntimeError(
+            f"{universe_name} 历史扫描终点与Wind当前成分不一致，"
+            "为避免错误信号已停止运行"
+        )
+
+    final_date, _ = get_latest_universe_constituent_snapshot(
+        universe_name,
+        on_or_before=target_date,
+        db_path=db_path,
+    )
+    result.update(
+        {
+            "status": "updated",
+            "latest_snapshot_after_check": final_date,
+            "written_change_dates": written_change_dates,
+        }
+    )
+    return result
 
 
 def count_complete_price_rows(
