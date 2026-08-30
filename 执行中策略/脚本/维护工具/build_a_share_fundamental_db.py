@@ -2,8 +2,10 @@ from WindPy import w
 import argparse
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 
 
@@ -13,6 +15,7 @@ CACHE_DIR = os.path.join(BASE_DIR, "缓存")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(CACHE_DIR, "全部A股_基础基本面.sqlite3")
+MARKET_DB_PATH = os.path.join(CACHE_DIR, "本地行情数据库.sqlite3")
 SECTOR_REFRESH_DAYS = 7
 
 SECTOR_ID = "a001010100000000"
@@ -46,8 +49,24 @@ QFA_REPORT_FIELDS = {
     "gross_profit_margin_qfa": "qfa_grossprofitmargin",
     "net_profit_margin_qfa": "qfa_netprofitmargin",
 }
+QUALITY_REPORT_FIELDS = {
+    "roe_reported": "roe",
+    "debt_to_assets_reported": "debttoassets",
+}
+TTM_ROE_REPORT_FIELDS = {
+    "net_profit_parent_ytd": "np_belongto_parcomsh",
+    "parent_equity": "eqy_belongto_parcomsh",
+    "total_operating_revenue_ytd": "tot_oper_rev",
+}
 REPORT_DISCLOSURE_FIELD = "stm_issuingdate"
 QFA_REPORT_BATCH_KEY = "qfa_report_actual"
+QUALITY_REPORT_BATCH_KEY = "quality_report_actual"
+TTM_ROE_REPORT_BATCH_KEY = "ttm_valuation_report_actual_v2"
+MONTHLY_MARKET_FIELDS = {
+    "market_cap_monthly": "mkt_cap_ard",
+    "unadjusted_close_monthly": "close",
+}
+PIT_VALUATION_VERSION = "formal_report_asof_v1"
 
 def get_bool_env(name, default=False):
     value = os.environ.get(name)
@@ -122,6 +141,21 @@ def normalize_date(value):
     return pd.Timestamp(value).strftime("%Y-%m-%d")
 
 
+def wind_wss_with_retry(codes, fields, options, attempts=4):
+    for attempt in range(attempts):
+        data = w.wss(codes, fields, options)
+        if data.ErrorCode not in WIND_QUOTA_ERROR_CODES:
+            return data
+        if attempt < attempts - 1:
+            wait_seconds = 2 ** (attempt + 1)
+            print(
+                f"Wind 暂时限流，{wait_seconds} 秒后重试 "
+                f"({attempt + 1}/{attempts - 1})"
+            )
+            time.sleep(wait_seconds)
+    return data
+
+
 def init_db(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS fundamentals (
@@ -133,6 +167,26 @@ def init_db(conn):
             dividend_yield REAL,
             roe_ttm REAL,
             debt_to_assets REAL,
+            roe_reported REAL,
+            debt_to_assets_reported REAL,
+            roe_ttm_calculated REAL,
+            roe_ttm_report_period TEXT,
+            roe_ttm_announcement_date TEXT,
+            roe_ttm_available_date TEXT,
+            market_cap_monthly REAL,
+            unadjusted_close_monthly REAL,
+            pe_ttm_calculated REAL,
+            pb_lf_calculated REAL,
+            ps_ttm_calculated REAL,
+            dividend_yield_calculated REAL,
+            valuation_report_period TEXT,
+            valuation_announcement_date TEXT,
+            valuation_available_date TEXT,
+            valuation_calculation_version TEXT,
+            dividend_event_count INTEGER,
+            quality_report_period TEXT,
+            quality_announcement_date TEXT,
+            quality_available_date TEXT,
             revenue_yoy_qfa REAL,
             netprofit_yoy_qfa REAL,
             gross_profit_margin_qfa REAL,
@@ -154,6 +208,14 @@ def init_db(conn):
             netprofit_yoy_qfa REAL,
             gross_profit_margin_qfa REAL,
             net_profit_margin_qfa REAL,
+            roe_reported REAL,
+            debt_to_assets_reported REAL,
+            net_profit_parent_ytd REAL,
+            parent_equity REAL,
+            total_operating_revenue_ytd REAL,
+            ttm_net_profit_parent REAL,
+            ttm_total_operating_revenue REAL,
+            roe_ttm_calculated REAL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (rpt_date, wind_code)
         )
@@ -214,10 +276,27 @@ def ensure_fundamental_columns(conn):
         row[1]
         for row in conn.execute("PRAGMA table_info(fundamentals)").fetchall()
     }
-    for field_key in list(FUNDAMENTAL_FIELDS) + list(QFA_REPORT_FIELDS) + [
+    for field_key in list(FUNDAMENTAL_FIELDS) + list(QFA_REPORT_FIELDS) + list(QUALITY_REPORT_FIELDS) + [
+        "roe_ttm_calculated",
+        *MONTHLY_MARKET_FIELDS,
+        "pe_ttm_calculated",
+        "pb_lf_calculated",
+        "ps_ttm_calculated",
+        "dividend_yield_calculated",
+        "dividend_event_count",
+        "valuation_calculation_version",
+        "valuation_report_period",
+        "valuation_announcement_date",
+        "valuation_available_date",
         "qfa_report_period",
         "qfa_announcement_date",
         "qfa_available_date",
+        "quality_report_period",
+        "quality_announcement_date",
+        "quality_available_date",
+        "roe_ttm_report_period",
+        "roe_ttm_announcement_date",
+        "roe_ttm_available_date",
     ]:
         if field_key in existing_columns:
             continue
@@ -225,6 +304,16 @@ def ensure_fundamental_columns(conn):
             "qfa_report_period",
             "qfa_announcement_date",
             "qfa_available_date",
+            "quality_report_period",
+            "quality_announcement_date",
+            "quality_available_date",
+            "roe_ttm_report_period",
+            "roe_ttm_announcement_date",
+            "roe_ttm_available_date",
+            "valuation_calculation_version",
+            "valuation_report_period",
+            "valuation_announcement_date",
+            "valuation_available_date",
         } else "REAL"
         conn.execute(f"ALTER TABLE fundamentals ADD COLUMN {field_key} {column_type}")
 
@@ -232,7 +321,18 @@ def ensure_fundamental_columns(conn):
         row[1]
         for row in conn.execute("PRAGMA table_info(financial_reports)").fetchall()
     }
-    for field_key in list(QFA_REPORT_FIELDS) + ["announcement_date", "available_date"]:
+    for field_key in (
+        list(QFA_REPORT_FIELDS)
+        + list(QUALITY_REPORT_FIELDS)
+        + list(TTM_ROE_REPORT_FIELDS)
+        + [
+            "ttm_net_profit_parent",
+            "ttm_total_operating_revenue",
+            "roe_ttm_calculated",
+            "announcement_date",
+            "available_date",
+        ]
+    ):
         if field_key in existing_report_columns:
             continue
         column_type = "TEXT" if field_key.endswith("date") else "REAL"
@@ -318,6 +418,38 @@ def save_stock_universe(conn, universe_df):
     conn.commit()
 
 
+def load_historical_universe_union(start_date, end_date):
+    """读取回测期真实出现过的股票，包含后来退市或移出当前全A的证券。"""
+    if not os.path.exists(MARKET_DB_PATH):
+        return pd.DataFrame(columns=["wind_code", "sec_name"])
+    with sqlite3.connect(MARKET_DB_PATH) as market_conn:
+        try:
+            frame = pd.read_sql_query(
+                """
+                SELECT wind_code, MAX(sec_name) AS sec_name
+                FROM universe_constituents_snapshot
+                WHERE universe_name = '全部A股'
+                  AND snapshot_date >= ? AND snapshot_date <= ?
+                GROUP BY wind_code
+                ORDER BY wind_code
+                """,
+                market_conn,
+                params=[start_date, end_date],
+            )
+        except sqlite3.OperationalError:
+            return pd.DataFrame(columns=["wind_code", "sec_name"])
+    return frame
+
+
+def merge_current_and_historical_universe(current, start_date, end_date):
+    historical = load_historical_universe_union(start_date, end_date)
+    if historical.empty:
+        return current.drop_duplicates("wind_code", keep="last")
+    combined = pd.concat([historical, current], ignore_index=True)
+    combined["sec_name"] = combined["sec_name"].fillna(combined["wind_code"])
+    return combined.drop_duplicates("wind_code", keep="last").sort_values("wind_code")
+
+
 def get_trading_days(start_date, end_date):
     data = w.tdays(start_date, end_date, "")
     if data.ErrorCode != 0 or not data.Data:
@@ -332,14 +464,15 @@ def get_monthly_snapshot_dates(start_date, end_date):
     snapshot_dates = (
         pd.Series(trading_days, index=trading_days)
         .groupby(trading_days.to_period("M"))
-        .first()
+        .last()
         .tolist()
     )
     return [normalize_date(date) for date in snapshot_dates]
 
 
 def get_quarter_report_dates(start_date, end_date):
-    start_year = pd.Timestamp(start_date).year - 1
+    # 首个回测截面的 TTM 需要上年同季和上年年报，因此向前多取两年。
+    start_year = pd.Timestamp(start_date).year - 2
     end_ts = pd.Timestamp(end_date)
     report_dates = []
     for year in range(start_year, end_ts.year + 1):
@@ -581,7 +714,24 @@ def fetch_one_batch(conn, codes, trade_date, field_key, wind_field, batch_start,
         return "skip", 0
 
     batch_codes = codes[batch_start:batch_end]
-    estimated_cells = len(batch_codes)
+    marks = ",".join("?" for _ in batch_codes)
+    existing_codes = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT wind_code FROM fundamentals WHERE trade_date=? "
+            f"AND {field_key} IS NOT NULL AND wind_code IN ({marks})",
+            [trade_date, *batch_codes],
+        ).fetchall()
+    }
+    query_codes = [code for code in batch_codes if code not in existing_codes]
+    if not query_codes:
+        save_batch_status(
+            conn, trade_date, field_key, batch_start, batch_end,
+            "success", len(existing_codes), 0, "本地数据已完整",
+        )
+        conn.commit()
+        return "local_skip", len(existing_codes)
+    estimated_cells = len(query_codes)
     if budget is not None and not budget.reserve(label, estimated_cells):
         return "budget_skip", 0
 
@@ -589,7 +739,7 @@ def fetch_one_batch(conn, codes, trade_date, field_key, wind_field, batch_start,
         f"拉取 {field_key}({wind_field}) "
         f"{trade_date} 股票 {batch_start}-{batch_end}"
     )
-    data = w.wss(batch_codes, wind_field, f"tradeDate={trade_date}")
+    data = wind_wss_with_retry(query_codes, wind_field, f"tradeDate={trade_date}")
     df, error_code, error_message = parse_single_field_snapshot(data, trade_date, field_key)
 
     if error_code != 0:
@@ -634,6 +784,33 @@ def fetch_one_batch(conn, codes, trade_date, field_key, wind_field, batch_start,
     return "success", non_null_count
 
 
+def upsert_monthly_market_cap_from_daily_valuation(conn, snapshot_dates):
+    if not snapshot_dates:
+        return 0
+    marks = ",".join("?" for _ in snapshot_dates)
+    rows = conn.execute(
+        f"""SELECT trade_date, wind_code, mkt_cap_ard
+        FROM daily_valuation
+        WHERE trade_date IN ({marks}) AND mkt_cap_ard IS NOT NULL""",
+        snapshot_dates,
+    ).fetchall()
+    if not rows:
+        return 0
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    conn.executemany(
+        """INSERT INTO fundamentals
+        (trade_date,wind_code,market_cap_monthly,updated_at)
+        VALUES (?,?,?,?)
+        ON CONFLICT(trade_date,wind_code) DO UPDATE SET
+        market_cap_monthly=excluded.market_cap_monthly,
+        updated_at=excluded.updated_at""",
+        [(trade_date, code, value, updated_at) for trade_date, code, value in rows],
+    )
+    conn.commit()
+    print(f"从本地日频市值复制月末截面：{len(rows)} 行")
+    return len(rows)
+
+
 def fetch_warmup_fundamental_batch(
     conn,
     codes,
@@ -675,7 +852,9 @@ def fetch_warmup_fundamental_batch(
         f"拉取预热月频基本面({','.join(wind_fields)}) "
         f"{trade_date} 股票 {batch_start}-{batch_end}"
     )
-    data = w.wss(batch_codes, ",".join(wind_fields), f"tradeDate={trade_date}")
+    data = wind_wss_with_retry(
+        batch_codes, ",".join(wind_fields), f"tradeDate={trade_date}"
+    )
     if data.ErrorCode != 0 or not data.Codes or not data.Data:
         error_message = ""
         if data.Codes and data.Codes[0] == "ErrorReport" and data.Data:
@@ -930,8 +1109,13 @@ def parse_report_snapshot(data, rpt_date, wind_fields, field_keys):
             records[field_key] = [None] * len(data.Codes)
 
     df = pd.DataFrame(records)
-    for field_key in QFA_REPORT_FIELDS:
-        df[field_key] = pd.to_numeric(df[field_key], errors="coerce")
+    for field_key in (
+        list(QFA_REPORT_FIELDS)
+        + list(QUALITY_REPORT_FIELDS)
+        + list(TTM_ROE_REPORT_FIELDS)
+    ):
+        if field_key in df.columns:
+            df[field_key] = pd.to_numeric(df[field_key], errors="coerce")
     df["announcement_date"] = pd.to_datetime(df["announcement_date"], errors="coerce")
     return df, 0, ""
 
@@ -1010,7 +1194,9 @@ def fetch_report_batch(conn, codes, rpt_date, batch_start, batch_end, trading_da
         f"拉取 {QFA_REPORT_BATCH_KEY}({wind_fields_text}) "
         f"{rpt_date} 股票 {batch_start}-{batch_end}"
     )
-    data = w.wss(batch_codes, wind_fields_text, f"rptDate={rpt_date_for_wind}")
+    data = wind_wss_with_retry(
+        batch_codes, wind_fields_text, f"rptDate={rpt_date_for_wind}"
+    )
     df, error_code, error_message = parse_report_snapshot(
         data, rpt_date, wind_fields, field_keys
     )
@@ -1064,6 +1250,603 @@ def fetch_report_batch(conn, codes, rpt_date, batch_start, batch_end, trading_da
     )
     conn.commit()
     return "success", non_null_count
+
+
+def fetch_quality_report_batch(
+    conn, codes, rpt_date, batch_start, batch_end, trading_days, budget=None
+):
+    """按报告期抓取质量指标，避免 roe_ttm/debttoassets 的 tradeDate 失真。"""
+    status, non_null_count, error_code = batch_status(
+        conn, rpt_date, QUALITY_REPORT_BATCH_KEY, batch_start, batch_end
+    )
+    label = f"{QUALITY_REPORT_BATCH_KEY} {rpt_date} 股票 {batch_start}-{batch_end}"
+    if should_skip_quota_failed_batch(status, error_code, label):
+        return "quota_failed_skip", 0
+    if should_skip_confirmed_empty_batch(status, label):
+        return "confirmed_empty_skip", 0
+    if status == "success" and non_null_count > 0:
+        return "skip", 0
+
+    batch_codes = codes[batch_start:batch_end]
+    wind_fields = list(QUALITY_REPORT_FIELDS.values()) + [REPORT_DISCLOSURE_FIELD]
+    field_keys = list(QUALITY_REPORT_FIELDS) + ["announcement_date"]
+    estimated_cells = len(batch_codes) * len(wind_fields)
+    if budget is not None and not budget.reserve(label, estimated_cells):
+        return "budget_skip", 0
+
+    rpt_date_for_wind = rpt_date.replace("-", "")
+    wind_fields_text = ",".join(wind_fields)
+    print(
+        f"拉取 {QUALITY_REPORT_BATCH_KEY}({wind_fields_text}) "
+        f"{rpt_date} 股票 {batch_start}-{batch_end}"
+    )
+    data = wind_wss_with_retry(
+        batch_codes, wind_fields_text, f"rptDate={rpt_date_for_wind}"
+    )
+    df, error_code, error_message = parse_report_snapshot(
+        data, rpt_date, wind_fields, field_keys
+    )
+    if error_code != 0:
+        save_batch_status(
+            conn, rpt_date, QUALITY_REPORT_BATCH_KEY, batch_start, batch_end,
+            "failed", 0, error_code, error_message,
+        )
+        conn.commit()
+        print(f"失败: {label} ErrorCode={error_code} {error_message}")
+        return "failed", 0
+
+    for field_key in QUALITY_REPORT_FIELDS:
+        df[field_key] = pd.to_numeric(df[field_key], errors="coerce")
+    non_null_count = int(df[list(QUALITY_REPORT_FIELDS)].notna().any(axis=1).sum())
+    if non_null_count == 0:
+        next_status = save_empty_or_confirmed_status(
+            conn, rpt_date, QUALITY_REPORT_BATCH_KEY, batch_start, batch_end
+        )
+        conn.commit()
+        return next_status, 0
+
+    df["announcement_date"] = df["announcement_date"].apply(
+        lambda value: normalize_date(value) if pd.notna(value) else None
+    )
+    df["available_date"] = df["announcement_date"].apply(
+        lambda value: get_next_trading_date(value, trading_days)
+        if value is not None else None
+    )
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = [
+        (
+            row.rpt_date, row.wind_code, row.announcement_date, row.available_date,
+            row.roe_reported, row.debt_to_assets_reported, updated_at,
+        )
+        for row in df.itertuples(index=False)
+    ]
+    conn.executemany("""
+        INSERT INTO financial_reports (
+            rpt_date, wind_code, announcement_date, available_date,
+            roe_reported, debt_to_assets_reported, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(rpt_date, wind_code) DO UPDATE SET
+            announcement_date = COALESCE(excluded.announcement_date, financial_reports.announcement_date),
+            available_date = COALESCE(excluded.available_date, financial_reports.available_date),
+            roe_reported = excluded.roe_reported,
+            debt_to_assets_reported = excluded.debt_to_assets_reported,
+            updated_at = excluded.updated_at
+    """, rows)
+    save_batch_status(
+        conn, rpt_date, QUALITY_REPORT_BATCH_KEY, batch_start, batch_end,
+        "success", non_null_count, 0, "",
+    )
+    conn.commit()
+    return "success", non_null_count
+
+
+def fetch_ttm_roe_report_batch(
+    conn, codes, rpt_date, batch_start, batch_end, trading_days, budget=None
+):
+    """抓取自算 ROE/PE/PB/PS 所需的累计利润、净资产和营业收入。"""
+    status, non_null_count, error_code = batch_status(
+        conn, rpt_date, TTM_ROE_REPORT_BATCH_KEY, batch_start, batch_end
+    )
+    label = f"{TTM_ROE_REPORT_BATCH_KEY} {rpt_date} 股票 {batch_start}-{batch_end}"
+    if should_skip_quota_failed_batch(status, error_code, label):
+        return "quota_failed_skip", 0
+    if should_skip_confirmed_empty_batch(status, label):
+        return "confirmed_empty_skip", 0
+    if status == "success" and non_null_count > 0:
+        return "skip", 0
+
+    batch_codes = codes[batch_start:batch_end]
+    wind_fields = list(TTM_ROE_REPORT_FIELDS.values()) + [REPORT_DISCLOSURE_FIELD]
+    field_keys = list(TTM_ROE_REPORT_FIELDS) + ["announcement_date"]
+    estimated_cells = len(batch_codes) * len(wind_fields)
+    if budget is not None and not budget.reserve(label, estimated_cells):
+        return "budget_skip", 0
+
+    rpt_date_for_wind = rpt_date.replace("-", "")
+    wind_fields_text = ",".join(wind_fields)
+    print(
+        f"拉取 {TTM_ROE_REPORT_BATCH_KEY}({wind_fields_text}) "
+        f"{rpt_date} 股票 {batch_start}-{batch_end}"
+    )
+    data = wind_wss_with_retry(
+        batch_codes,
+        wind_fields_text,
+        f"rptDate={rpt_date_for_wind};rptType=1;unit=1",
+    )
+    df, error_code, error_message = parse_report_snapshot(
+        data, rpt_date, wind_fields, field_keys
+    )
+    if error_code != 0:
+        save_batch_status(
+            conn, rpt_date, TTM_ROE_REPORT_BATCH_KEY, batch_start, batch_end,
+            "failed", 0, error_code, error_message,
+        )
+        conn.commit()
+        print(f"失败: {label} ErrorCode={error_code} {error_message}")
+        return "failed", 0
+
+    for field_key in TTM_ROE_REPORT_FIELDS:
+        df[field_key] = pd.to_numeric(df[field_key], errors="coerce")
+    non_null_count = int(df[list(TTM_ROE_REPORT_FIELDS)].notna().any(axis=1).sum())
+    if non_null_count == 0:
+        next_status = save_empty_or_confirmed_status(
+            conn, rpt_date, TTM_ROE_REPORT_BATCH_KEY, batch_start, batch_end
+        )
+        conn.commit()
+        return next_status, 0
+
+    df["announcement_date"] = df["announcement_date"].apply(
+        lambda value: normalize_date(value) if pd.notna(value) else None
+    )
+    df["available_date"] = df["announcement_date"].apply(
+        lambda value: get_next_trading_date(value, trading_days)
+        if value is not None else None
+    )
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = [
+        (
+            row.rpt_date, row.wind_code, row.announcement_date,
+            row.available_date, row.net_profit_parent_ytd,
+            row.parent_equity, row.total_operating_revenue_ytd, updated_at,
+        )
+        for row in df.itertuples(index=False)
+    ]
+    conn.executemany("""
+        INSERT INTO financial_reports (
+            rpt_date, wind_code, announcement_date, available_date,
+            net_profit_parent_ytd, parent_equity,
+            total_operating_revenue_ytd, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(rpt_date, wind_code) DO UPDATE SET
+            announcement_date = COALESCE(excluded.announcement_date, financial_reports.announcement_date),
+            available_date = COALESCE(excluded.available_date, financial_reports.available_date),
+            net_profit_parent_ytd = excluded.net_profit_parent_ytd,
+            parent_equity = excluded.parent_equity,
+            total_operating_revenue_ytd = excluded.total_operating_revenue_ytd,
+            updated_at = excluded.updated_at
+    """, rows)
+    save_batch_status(
+        conn, rpt_date, TTM_ROE_REPORT_BATCH_KEY, batch_start, batch_end,
+        "success", non_null_count, 0, "",
+    )
+    conn.commit()
+    return "success", non_null_count
+
+
+def calculate_and_upsert_ttm_roe(conn):
+    """用累计报表按公告期口径计算 TTM 归母净利润、收入和 ROE。"""
+    reports = pd.read_sql_query("""
+        SELECT rpt_date, wind_code, net_profit_parent_ytd, parent_equity,
+               total_operating_revenue_ytd
+        FROM financial_reports
+        WHERE net_profit_parent_ytd IS NOT NULL OR parent_equity IS NOT NULL
+           OR total_operating_revenue_ytd IS NOT NULL
+    """, conn)
+    if reports.empty:
+        print("没有可用的 TTM ROE 原始报表数据")
+        return 0
+
+    reports["rpt_ts"] = pd.to_datetime(reports["rpt_date"], errors="coerce")
+    reports = reports.dropna(subset=["rpt_ts"]).copy()
+    lookup = reports.set_index(["wind_code", "rpt_date"])
+    updates = []
+    for row in reports.itertuples(index=False):
+        rpt_ts = row.rpt_ts
+        prior_year = rpt_ts - pd.DateOffset(years=1)
+        prior_same_date = prior_year.strftime("%Y-%m-%d")
+        prior_annual_date = f"{rpt_ts.year - 1}-12-31"
+        try:
+            prior_same = lookup.loc[(row.wind_code, prior_same_date)]
+        except KeyError:
+            prior_same = None
+        if rpt_ts.month == 12:
+            ttm_profit = row.net_profit_parent_ytd
+            ttm_revenue = row.total_operating_revenue_ytd
+        else:
+            try:
+                prior_annual = lookup.loc[(row.wind_code, prior_annual_date)]
+            except KeyError:
+                prior_annual = None
+            values = [
+                row.net_profit_parent_ytd,
+                None if prior_annual is None else prior_annual.net_profit_parent_ytd,
+                None if prior_same is None else prior_same.net_profit_parent_ytd,
+            ]
+            ttm_profit = (
+                values[0] + values[1] - values[2]
+                if all(pd.notna(value) for value in values) else None
+            )
+            revenue_values = [
+                row.total_operating_revenue_ytd,
+                None if prior_annual is None else prior_annual.total_operating_revenue_ytd,
+                None if prior_same is None else prior_same.total_operating_revenue_ytd,
+            ]
+            ttm_revenue = (
+                revenue_values[0] + revenue_values[1] - revenue_values[2]
+                if all(pd.notna(value) for value in revenue_values) else None
+            )
+        prior_equity = None if prior_same is None else prior_same.parent_equity
+        average_equity = (
+            (row.parent_equity + prior_equity) / 2
+            if pd.notna(row.parent_equity) and pd.notna(prior_equity) else None
+        )
+        roe = (
+            100.0 * ttm_profit / average_equity
+            if pd.notna(ttm_profit) and pd.notna(average_equity) and average_equity > 0
+            else None
+        )
+        updates.append((ttm_profit, ttm_revenue, roe, row.rpt_date, row.wind_code))
+
+    conn.executemany("""
+        UPDATE financial_reports
+        SET ttm_net_profit_parent = ?,
+            ttm_total_operating_revenue = ?,
+            roe_ttm_calculated = ?
+        WHERE rpt_date = ? AND wind_code = ?
+    """, updates)
+    conn.commit()
+    non_null = sum(value[0] is not None for value in updates)
+    revenue_non_null = sum(value[1] is not None for value in updates)
+    print(
+        f"自算 TTM 完成：利润 {non_null}/{len(updates)}，"
+        f"营业收入 {revenue_non_null}/{len(updates)}"
+    )
+    return non_null
+
+
+def upsert_ttm_roe_asof_fundamentals(conn, snapshot_dates):
+    reports = pd.read_sql_query("""
+        SELECT rpt_date, wind_code, announcement_date, available_date,
+               roe_ttm_calculated
+        FROM financial_reports
+        WHERE available_date IS NOT NULL AND roe_ttm_calculated IS NOT NULL
+    """, conn)
+    if reports.empty:
+        print("没有可用的自算 TTM ROE，跳过月度 as-of 回填")
+        return 0
+    reports["available_ts"] = pd.to_datetime(reports["available_date"], errors="coerce")
+    reports["rpt_ts"] = pd.to_datetime(reports["rpt_date"], errors="coerce")
+    reports = reports.dropna(subset=["available_ts", "rpt_ts"])
+    reports = reports.sort_values(["wind_code", "available_ts", "rpt_ts"])
+    snapshot_df = pd.DataFrame({
+        "trade_date": snapshot_dates,
+        "snapshot_ts": pd.to_datetime(snapshot_dates),
+    }).sort_values("snapshot_ts")
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = []
+    for code, code_reports in reports.groupby("wind_code", sort=False):
+        merged = pd.merge_asof(
+            snapshot_df,
+            code_reports.sort_values("available_ts"),
+            left_on="snapshot_ts",
+            right_on="available_ts",
+            direction="backward",
+        )
+        merged = merged[merged["rpt_date"].notna()]
+        for row in merged.itertuples(index=False):
+            rows.append((
+                row.trade_date, code, row.roe_ttm_calculated, row.rpt_date,
+                row.announcement_date, row.available_date, updated_at,
+            ))
+    conn.executemany("""
+        INSERT INTO fundamentals (
+            trade_date, wind_code, roe_ttm_calculated,
+            roe_ttm_report_period, roe_ttm_announcement_date,
+            roe_ttm_available_date, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trade_date, wind_code) DO UPDATE SET
+            roe_ttm_calculated = excluded.roe_ttm_calculated,
+            roe_ttm_report_period = excluded.roe_ttm_report_period,
+            roe_ttm_announcement_date = excluded.roe_ttm_announcement_date,
+            roe_ttm_available_date = excluded.roe_ttm_available_date,
+            updated_at = excluded.updated_at
+    """, rows)
+    conn.commit()
+    print(f"自算 TTM ROE 月度 as-of 回填完成：{len(rows)} 行")
+    return len(rows)
+
+
+def load_confirmed_dividend_events():
+    """只读取已实施且日期链完整的现金分红事件。"""
+    if not os.path.exists(MARKET_DB_PATH):
+        return pd.DataFrame(columns=[
+            "wind_code", "ex_date", "cash_before_tax",
+            "proposal_announcement_date", "implementation_announcement_date",
+        ])
+    with sqlite3.connect(MARKET_DB_PATH) as market_conn:
+        columns = {
+            row[1]
+            for row in market_conn.execute(
+                "PRAGMA table_info(corporate_action_events)"
+            ).fetchall()
+        }
+        required = {
+            "wind_code", "ex_date", "cash_before_tax",
+            "proposal_announcement_date", "implementation_announcement_date",
+        }
+        if not required.issubset(columns):
+            return pd.DataFrame(columns=sorted(required))
+        events = pd.read_sql_query(
+            """
+            SELECT wind_code, ex_date, cash_before_tax,
+                   proposal_announcement_date,
+                   implementation_announcement_date
+            FROM corporate_action_events
+            WHERE ex_date IS NOT NULL AND cash_before_tax IS NOT NULL
+              AND cash_before_tax > 0
+              AND proposal_announcement_date IS NOT NULL
+              AND implementation_announcement_date IS NOT NULL
+              AND implementation_announcement_date <= ex_date
+            """,
+            market_conn,
+        )
+    if events.empty:
+        return events
+    for column in [
+        "ex_date", "proposal_announcement_date", "implementation_announcement_date"
+    ]:
+        events[column] = pd.to_datetime(events[column], errors="coerce")
+    return events.dropna(subset=[
+        "ex_date", "proposal_announcement_date", "implementation_announcement_date"
+    ])
+
+
+def dividend_history_is_complete(snapshot_dates):
+    if not snapshot_dates or not os.path.exists(MARKET_DB_PATH):
+        return False
+    required_start = (
+        pd.Timestamp(min(snapshot_dates)) - pd.DateOffset(years=1)
+    ).strftime("%Y-%m-%d")
+    required_end = max(snapshot_dates)
+    with sqlite3.connect(MARKET_DB_PATH) as market_conn:
+        try:
+            values = dict(market_conn.execute(
+                """SELECT key, value FROM metadata
+                WHERE key IN ('pit_dividend_complete_start_date',
+                              'pit_dividend_complete_end_date')"""
+            ).fetchall())
+        except sqlite3.OperationalError:
+            return False
+    start = values.get("pit_dividend_complete_start_date")
+    end = values.get("pit_dividend_complete_end_date")
+    return bool(start and end and start <= required_start and end >= required_end)
+
+
+def calculate_and_upsert_pit_valuations(conn, snapshot_dates):
+    """用月末市值与当时已可用的正式财报重算 PE/PB/PS/股息率。"""
+    market = pd.read_sql_query(
+        """
+        SELECT trade_date, wind_code, market_cap_monthly,
+               unadjusted_close_monthly
+        FROM fundamentals
+        WHERE trade_date IN ({})
+          AND (market_cap_monthly IS NOT NULL
+               OR unadjusted_close_monthly IS NOT NULL)
+        """.format(",".join("?" for _ in snapshot_dates)),
+        conn,
+        params=snapshot_dates,
+    )
+    reports = pd.read_sql_query(
+        """
+        SELECT rpt_date, wind_code, announcement_date, available_date,
+               ttm_net_profit_parent, parent_equity,
+               ttm_total_operating_revenue
+        FROM financial_reports
+        WHERE available_date IS NOT NULL
+          AND (ttm_net_profit_parent IS NOT NULL OR parent_equity IS NOT NULL
+               OR ttm_total_operating_revenue IS NOT NULL)
+        """,
+        conn,
+    )
+    if market.empty or reports.empty:
+        print("月频市值或正式财报不足，跳过 PIT 估值计算")
+        return 0
+
+    market["trade_ts"] = pd.to_datetime(market["trade_date"], errors="coerce")
+    reports["available_ts"] = pd.to_datetime(reports["available_date"], errors="coerce")
+    reports["rpt_ts"] = pd.to_datetime(reports["rpt_date"], errors="coerce")
+    reports = reports.dropna(subset=["available_ts", "rpt_ts"])
+    report_groups = {
+        code: group.sort_values(["available_ts", "rpt_ts"])
+        for code, group in reports.groupby("wind_code", sort=False)
+    }
+    dividend_coverage_complete = dividend_history_is_complete(snapshot_dates)
+    dividends = (
+        load_confirmed_dividend_events()
+        if dividend_coverage_complete else pd.DataFrame()
+    )
+    dividend_groups = {
+        code: group.sort_values("ex_date")
+        for code, group in dividends.groupby("wind_code", sort=False)
+    } if not dividends.empty else {}
+
+    pieces = []
+    for code, code_market in market.groupby("wind_code", sort=False):
+        code_reports = report_groups.get(code)
+        if code_reports is None:
+            merged = code_market.copy()
+            for column in [
+                "rpt_date", "announcement_date", "available_date",
+                "ttm_net_profit_parent", "parent_equity",
+                "ttm_total_operating_revenue",
+            ]:
+                merged[column] = np.nan
+        else:
+            merged = pd.merge_asof(
+                code_market.sort_values("trade_ts"),
+                code_reports[[
+                    "available_ts", "rpt_date", "announcement_date",
+                    "available_date", "ttm_net_profit_parent", "parent_equity",
+                    "ttm_total_operating_revenue",
+                ]],
+                left_on="trade_ts",
+                right_on="available_ts",
+                direction="backward",
+            )
+        code_dividends = dividend_groups.get(code)
+        dividend_sums = []
+        dividend_counts = []
+        for trade_ts in merged["trade_ts"]:
+            if not dividend_coverage_complete:
+                dividend_sums.append(np.nan)
+                dividend_counts.append(None)
+                continue
+            if code_dividends is None:
+                dividend_sums.append(0.0)
+                dividend_counts.append(0)
+                continue
+            window_start = trade_ts - pd.DateOffset(years=1)
+            used = code_dividends[
+                (code_dividends["ex_date"] > window_start)
+                & (code_dividends["ex_date"] <= trade_ts)
+                & (code_dividends["implementation_announcement_date"] <= trade_ts)
+            ]
+            dividend_sums.append(float(used["cash_before_tax"].sum()))
+            dividend_counts.append(int(len(used)))
+        merged["trailing_cash_dividend_per_share"] = dividend_sums
+        merged["dividend_event_count"] = dividend_counts
+        pieces.append(merged)
+
+    result = pd.concat(pieces, ignore_index=True)
+    market_cap = pd.to_numeric(result["market_cap_monthly"], errors="coerce")
+    close = pd.to_numeric(result["unadjusted_close_monthly"], errors="coerce")
+    profit = pd.to_numeric(result["ttm_net_profit_parent"], errors="coerce")
+    equity = pd.to_numeric(result["parent_equity"], errors="coerce")
+    revenue = pd.to_numeric(result["ttm_total_operating_revenue"], errors="coerce")
+    result["pe_ttm_calculated"] = market_cap / profit.where(profit != 0)
+    result["pb_lf_calculated"] = market_cap / equity.where(equity != 0)
+    result["ps_ttm_calculated"] = market_cap / revenue.where(revenue != 0)
+    result["dividend_yield_calculated"] = (
+        result["trailing_cash_dividend_per_share"] / close.where(close > 0)
+    )
+    violation_count = int(
+        (
+            pd.to_datetime(result["available_date"], errors="coerce")
+            > result["trade_ts"]
+        ).sum()
+    )
+    if violation_count:
+        raise RuntimeError(f"PIT 估值出现可用日晚于交易日：{violation_count} 行")
+
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = [
+        (
+            row.pe_ttm_calculated, row.pb_lf_calculated,
+            row.ps_ttm_calculated, row.dividend_yield_calculated,
+            row.rpt_date if pd.notna(row.rpt_date) else None,
+            row.announcement_date if pd.notna(row.announcement_date) else None,
+            row.available_date if pd.notna(row.available_date) else None,
+            PIT_VALUATION_VERSION,
+            int(row.dividend_event_count)
+            if pd.notna(row.dividend_event_count) else None,
+            updated_at,
+            row.trade_date, row.wind_code,
+        )
+        for row in result.itertuples(index=False)
+    ]
+    conn.executemany(
+        """
+        UPDATE fundamentals
+        SET pe_ttm_calculated = ?, pb_lf_calculated = ?,
+            ps_ttm_calculated = ?, dividend_yield_calculated = ?,
+            valuation_report_period = ?, valuation_announcement_date = ?,
+            valuation_available_date = ?, valuation_calculation_version = ?,
+            dividend_event_count = ?, updated_at = ?
+        WHERE trade_date = ? AND wind_code = ?
+        """,
+        rows,
+    )
+    conn.commit()
+    print(
+        "PIT 月频估值完成："
+        f"PE {result['pe_ttm_calculated'].notna().sum()}，"
+        f"PB {result['pb_lf_calculated'].notna().sum()}，"
+        f"PS {result['ps_ttm_calculated'].notna().sum()}，"
+        f"股息率 {result['dividend_yield_calculated'].notna().sum()}"
+    )
+    return len(rows)
+
+
+def upsert_quality_asof_fundamentals(conn, snapshot_dates):
+    reports = pd.read_sql_query("""
+        SELECT rpt_date, wind_code, announcement_date, available_date,
+               roe_reported, debt_to_assets_reported
+        FROM financial_reports
+        WHERE available_date IS NOT NULL
+          AND (roe_reported IS NOT NULL OR debt_to_assets_reported IS NOT NULL)
+    """, conn)
+    if reports.empty:
+        print("没有可用的报告期质量指标，跳过月度 as-of 回填")
+        return 0
+
+    reports["available_ts"] = pd.to_datetime(reports["available_date"], errors="coerce")
+    reports["rpt_ts"] = pd.to_datetime(reports["rpt_date"], errors="coerce")
+    reports = reports.dropna(subset=["available_ts", "rpt_ts"])
+    reports = reports.sort_values(["wind_code", "available_ts", "rpt_ts"])
+    snapshot_df = pd.DataFrame({
+        "trade_date": snapshot_dates,
+        "snapshot_ts": pd.to_datetime(snapshot_dates),
+    }).sort_values("snapshot_ts")
+
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = []
+    for code, code_reports in reports.groupby("wind_code", sort=False):
+        merged = pd.merge_asof(
+            snapshot_df,
+            code_reports.sort_values("available_ts"),
+            left_on="snapshot_ts",
+            right_on="available_ts",
+            direction="backward",
+        )
+        merged = merged[merged["rpt_date"].notna()]
+        for row in merged.itertuples(index=False):
+            rows.append((
+                row.trade_date, code, row.roe_reported,
+                row.debt_to_assets_reported, row.rpt_date,
+                row.announcement_date, row.available_date, updated_at,
+            ))
+
+    conn.executemany("""
+        INSERT INTO fundamentals (
+            trade_date, wind_code, roe_reported, debt_to_assets_reported,
+            quality_report_period, quality_announcement_date,
+            quality_available_date, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trade_date, wind_code) DO UPDATE SET
+            roe_reported = excluded.roe_reported,
+            debt_to_assets_reported = excluded.debt_to_assets_reported,
+            quality_report_period = excluded.quality_report_period,
+            quality_announcement_date = excluded.quality_announcement_date,
+            quality_available_date = excluded.quality_available_date,
+            updated_at = excluded.updated_at
+    """, rows)
+    conn.commit()
+    print(f"报告期质量指标月度 as-of 回填完成：{len(rows)} 行")
+    return len(rows)
 
 
 def upsert_qfa_asof_fundamentals(conn, snapshot_dates):
@@ -1204,12 +1987,52 @@ def parse_args():
     )
     parser.add_argument("--warmup-start-date", default="2018-01-01")
     parser.add_argument("--warmup-end-date", default="2021-12-31")
+    parser.add_argument(
+        "--recalculate-only", action="store_true",
+        help="不连接 Wind，仅用本地原始数据重算月末 PIT 指标",
+    )
+    parser.add_argument(
+        "--pit-backfill-only", action="store_true",
+        help="只补月频市值/未复权收盘价和PIT估值原始财报，不抓旧便捷因子或日频市值",
+    )
     return parser.parse_args()
+
+
+def recalculate_from_local_data(start_date, end_date):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        init_db(conn)
+        snapshot_dates = [
+            row[0]
+            for row in conn.execute(
+                """SELECT MAX(trade_date) FROM daily_valuation
+                WHERE trade_date BETWEEN ? AND ?
+                GROUP BY SUBSTR(trade_date,1,7) ORDER BY 1""",
+                (start_date, end_date),
+            ).fetchall()
+        ]
+        if not snapshot_dates:
+            raise RuntimeError("本地日频市值库没有可用月末截面")
+        upsert_monthly_market_cap_from_daily_valuation(conn, snapshot_dates)
+        upsert_qfa_asof_fundamentals(conn, snapshot_dates)
+        upsert_quality_asof_fundamentals(conn, snapshot_dates)
+        calculate_and_upsert_ttm_roe(conn)
+        upsert_ttm_roe_asof_fundamentals(conn, snapshot_dates)
+        calculate_and_upsert_pit_valuations(conn, snapshot_dates)
+        summarize_progress(conn)
+    finally:
+        conn.close()
 
 
 def main():
     args = parse_args()
-    if args.warmup_only:
+    if args.recalculate_only:
+        recalculate_from_local_data(
+            normalize_date(args.warmup_start_date),
+            normalize_date(args.warmup_end_date),
+        )
+        return
+    if args.warmup_only or args.pit_backfill_only:
         build_start_date = normalize_date(args.warmup_start_date)
         end_date = normalize_date(args.warmup_end_date)
         if pd.Timestamp(end_date) < pd.Timestamp(build_start_date):
@@ -1221,7 +2044,10 @@ def main():
     conn = sqlite3.connect(DB_PATH)
     try:
         init_db(conn)
-        universe_df = get_sector_constituents(conn)
+        current_universe_df = get_sector_constituents(conn)
+        universe_df = merge_current_and_historical_universe(
+            current_universe_df, build_start_date, end_date
+        )
         save_stock_universe(conn, universe_df)
         codes = universe_df["wind_code"].tolist()
         budget = WindCellBudget(get_wind_cell_budget())
@@ -1229,24 +2055,30 @@ def main():
         snapshot_dates = get_monthly_snapshot_dates(build_start_date, end_date)
         report_dates = get_quarter_report_dates(build_start_date, end_date)
         report_trading_days = get_trading_days(
-            f"{pd.Timestamp(build_start_date).year - 1}-01-01",
+            f"{pd.Timestamp(build_start_date).year - 3}-01-01",
             end_date,
         )
 
         print(f"数据库文件：{DB_PATH}")
-        print(f"运行模式：{'仅补预热数据' if args.warmup_only else '日常构建/增量更新'}")
+        mode_text = (
+            "仅补PIT估值原始数据" if args.pit_backfill_only
+            else "仅补预热数据" if args.warmup_only
+            else "日常构建/增量更新"
+        )
+        print(f"运行模式：{mode_text}")
         print(f"股票数量：{len(codes)}")
         print(f"月度截面：{len(snapshot_dates)} 个，{snapshot_dates[0]} ~ {snapshot_dates[-1]}")
         print(f"财报报告期：{len(report_dates)} 个，{report_dates[0]} ~ {report_dates[-1]}")
         print(f"每批股票数：{BATCH_SIZE}")
         print_budget_model(budget)
+        upsert_monthly_market_cap_from_daily_valuation(conn, snapshot_dates)
 
         historical_daily_valuation_chunks = []
         force_daily_valuation_chunks = []
         current_year = None
         current_year_start = None
         current_year_trading_days = pd.DatetimeIndex([])
-        if args.warmup_only:
+        if args.warmup_only or args.pit_backfill_only:
             print("日频估值：预热模式明确跳过，不消耗历史日频市值额度")
         else:
             daily_valuation_chunks = list(
@@ -1287,7 +2119,7 @@ def main():
                     )
 
         for trade_date in snapshot_dates:
-            if args.warmup_only:
+            if args.warmup_only and not args.pit_backfill_only:
                 for batch_start in range(0, len(codes), BATCH_SIZE):
                     batch_end = min(batch_start + BATCH_SIZE, len(codes))
                     status, _ = fetch_warmup_fundamental_batch(
@@ -1299,7 +2131,7 @@ def main():
                         budget,
                     )
                     status_counts[status] = status_counts.get(status, 0) + 1
-            else:
+            elif not args.pit_backfill_only:
                 for field_key, wind_field in FUNDAMENTAL_FIELDS.items():
                     for batch_start in range(0, len(codes), BATCH_SIZE):
                         batch_end = min(batch_start + BATCH_SIZE, len(codes))
@@ -1314,6 +2146,23 @@ def main():
                             budget,
                         )
                         status_counts[status] = status_counts.get(status, 0) + 1
+
+            for field_key, wind_field in MONTHLY_MARKET_FIELDS.items():
+                for batch_start in range(0, len(codes), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(codes))
+                    status, _ = fetch_one_batch(
+                        conn,
+                        codes,
+                        trade_date,
+                        field_key,
+                        wind_field,
+                        batch_start,
+                        batch_end,
+                        budget,
+                    )
+                    status_counts[f"monthly_market_{status}"] = (
+                        status_counts.get(f"monthly_market_{status}", 0) + 1
+                    )
 
         # 已结束年份的起止日不再变化，继续使用固定年度批次回填。
         for chunk_start, chunk_end in historical_daily_valuation_chunks:
@@ -1335,7 +2184,7 @@ def main():
 
         # 当年的结束日每天都会变。每个字段、每个股票批次从上次
         # 成功区间的下一交易日续拉，避免每天重复申请年初至今的数据。
-        if not args.warmup_only:
+        if not args.warmup_only and not args.pit_backfill_only:
             for field_key, wind_field in DAILY_VALUATION_FIELDS.items():
                 for batch_start in range(0, len(codes), BATCH_SIZE):
                     batch_end = min(batch_start + BATCH_SIZE, len(codes))
@@ -1389,10 +2238,41 @@ def main():
                     )
                     status_counts[f"force_{status}"] = status_counts.get(f"force_{status}", 0) + 1
 
+        if not args.pit_backfill_only:
+            for rpt_date in report_dates:
+                for batch_start in range(0, len(codes), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(codes))
+                    status, _ = fetch_report_batch(
+                        conn,
+                        codes,
+                        rpt_date,
+                        batch_start,
+                        batch_end,
+                        report_trading_days,
+                        budget,
+                    )
+                    status_counts[status] = status_counts.get(status, 0) + 1
+
+            for rpt_date in report_dates:
+                for batch_start in range(0, len(codes), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(codes))
+                    status, _ = fetch_quality_report_batch(
+                        conn,
+                        codes,
+                        rpt_date,
+                        batch_start,
+                        batch_end,
+                        report_trading_days,
+                        budget,
+                    )
+                    status_counts[f"quality_{status}"] = (
+                        status_counts.get(f"quality_{status}", 0) + 1
+                    )
+
         for rpt_date in report_dates:
             for batch_start in range(0, len(codes), BATCH_SIZE):
                 batch_end = min(batch_start + BATCH_SIZE, len(codes))
-                status, _ = fetch_report_batch(
+                status, _ = fetch_ttm_roe_report_batch(
                     conn,
                     codes,
                     rpt_date,
@@ -1401,9 +2281,15 @@ def main():
                     report_trading_days,
                     budget,
                 )
-                status_counts[status] = status_counts.get(status, 0) + 1
+                status_counts[f"ttm_roe_{status}"] = (
+                    status_counts.get(f"ttm_roe_{status}", 0) + 1
+                )
 
         upsert_qfa_asof_fundamentals(conn, snapshot_dates)
+        upsert_quality_asof_fundamentals(conn, snapshot_dates)
+        calculate_and_upsert_ttm_roe(conn)
+        upsert_ttm_roe_asof_fundamentals(conn, snapshot_dates)
+        calculate_and_upsert_pit_valuations(conn, snapshot_dates)
         print_run_status(status_counts, budget)
         summarize_progress(conn)
         print("\n基础基本面数据库更新完成")

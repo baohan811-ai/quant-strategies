@@ -17,4 +17,5 @@ __pycache__/
 
 # Generated reports and logs
 执行中策略/输出/
+开发中策略/输出/
 *.html.zip

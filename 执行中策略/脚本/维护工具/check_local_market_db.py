@@ -94,11 +94,44 @@ def print_market_db_check(db_path=MARKET_DB_PATH):
                 MAX(trade_date) AS max_date
             FROM daily_prices
         """, conn)
+        raw_summary = pd.read_sql_query("""
+            SELECT
+                COUNT(*) AS rows,
+                COUNT(DISTINCT trade_date) AS trade_dates,
+                COUNT(DISTINCT wind_code) AS wind_codes,
+                MIN(trade_date) AS min_date,
+                MAX(trade_date) AS max_date,
+                SUM(open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL
+                    AND close IS NOT NULL AND volume IS NOT NULL AND amt IS NOT NULL)
+                    AS complete_eod_rows
+            FROM raw_daily_prices
+        """, conn)
+        factor_summary = pd.read_sql_query("""
+            SELECT
+                COUNT(*) AS rows,
+                COUNT(DISTINCT trade_date) AS trade_dates,
+                COUNT(DISTINCT wind_code) AS wind_codes,
+                MIN(trade_date) AS min_date,
+                MAX(trade_date) AS max_date,
+                SUM(adj_factor IS NULL OR adj_factor <= 0) AS invalid_rows
+            FROM price_adjustment_factors
+        """, conn)
+        quality = pd.read_sql_query("""
+            SELECT dataset, status, checked_at, details, updated_at
+            FROM market_data_quality
+            ORDER BY dataset
+        """, conn)
 
     print(f"\n通用行情库：{db_path}")
     print("表：", ", ".join(tables["name"].tolist()))
     print("日线行情：")
     print(price_summary.to_string(index=False))
+    print("\n权威原始行情：")
+    print(raw_summary.to_string(index=False))
+    print("\n复权因子：")
+    print(factor_summary.to_string(index=False))
+    print("\n行情质量状态：")
+    print(quality.to_string(index=False))
 
 
 def main():
@@ -108,4 +141,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

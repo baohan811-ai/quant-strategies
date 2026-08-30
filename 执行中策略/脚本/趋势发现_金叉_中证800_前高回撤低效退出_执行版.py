@@ -5,11 +5,13 @@ import tempfile
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from openpyxl.styles import Font
 from openpyxl.drawing.image import Image as OpenpyxlImage
 
 from 维护工具.local_market_db import (
     MARKET_DB_PATH,
+    TEMP_CACHE_DIR,
     ensure_market_data_updated,
     ensure_universe_constituents_current,
     get_latest_price_date,
@@ -18,12 +20,13 @@ from 维护工具.local_market_db import (
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(SCRIPT_DIR)
-CACHE_DIR = os.path.join(BASE_DIR, "缓存")
-os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(TEMP_CACHE_DIR, exist_ok=True)
 
 # =========================
 # 0. 参数
 # =========================
+A_SHARE_TIMEZONE = ZoneInfo("Asia/Shanghai")
+A_SHARE_CONTINUOUS_TRADING_START = (9, 30)
 MAX_HOLDINGS = 20
 INITIAL_WEIGHT = 1 / MAX_HOLDINGS
 TRANSACTION_COST_RATE = 0.0025
@@ -440,8 +443,20 @@ def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%d").date()
 
 
-end_dt = datetime.today()
+def realtime_quotes_are_usable(latest_trading_date, now=None):
+    """仅在中国市场当日已经开盘时，才允许把 WSQ 行情标为当天数据。"""
+    current_time = now or datetime.now(A_SHARE_TIMEZONE)
+    today_str = current_time.strftime("%Y-%m-%d")
+    opening_reached = (
+        current_time.hour,
+        current_time.minute,
+    ) >= A_SHARE_CONTINUOUS_TRADING_START
+    return latest_trading_date == today_str and opening_reached
+
+
+end_dt = datetime.now(A_SHARE_TIMEZONE)
 end_date = end_dt.strftime("%Y-%m-%d")
+realtime_quotes_enabled = False
 
 if TRADE_START_DATE is not None:
     trade_start_dt = parse_date(TRADE_START_DATE)
@@ -461,7 +476,7 @@ if TRADE_START_DATE is not None:
     if trade_start_dt > end_dt.date():
         raise ValueError("TRADE_START_DATE 不能晚于 end_date，请检查参数设置。")
 
-end_date = ensure_market_data_updated(
+wind_latest_trading_date = ensure_market_data_updated(
     w,
     end_date,
     universe_name=CACHE_PREFIX,
@@ -469,6 +484,35 @@ end_date = ensure_market_data_updated(
     price_fields=["open", "high", "low", "close", "volume", "amt"],
     target_codes=stock_codes,
 )
+now_local = datetime.now(A_SHARE_TIMEZONE)
+today_str = now_local.strftime("%Y-%m-%d")
+realtime_quotes_enabled = realtime_quotes_are_usable(
+    wind_latest_trading_date,
+    now=now_local,
+)
+
+if realtime_quotes_enabled:
+    end_date = wind_latest_trading_date
+    print(f"A股已开盘，允许使用 {end_date} 的 WSQ 实时行情。")
+else:
+    latest_local_price_date = get_latest_price_date()
+    if wind_latest_trading_date == today_str:
+        # 开盘前 WSQ 的 rt_last 往往仍是昨收，绝不能把它标成今天的行情。
+        complete_date_ceiling = (
+            pd.Timestamp(wind_latest_trading_date) - pd.Timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+    else:
+        # 周末和休市日，Wind 返回的最近交易日本身就是可用上限。
+        complete_date_ceiling = wind_latest_trading_date
+
+    if latest_local_price_date is None:
+        end_date = complete_date_ceiling
+    else:
+        end_date = min(latest_local_price_date, complete_date_ceiling)
+    print(
+        f"当前时间 {now_local.strftime('%H:%M:%S')} 尚无可用当日完整实时行情，"
+        f"策略统一使用本地最近完整交易日 {end_date}。"
+    )
 end_dt = pd.Timestamp(end_date).to_pydatetime()
 
 constituent_check = ensure_universe_constituents_current(
@@ -530,52 +574,6 @@ code_to_industry_level2 = fetch_wind_level2_industry_map(stock_codes, end_date)
 missing_industry_count = len([code for code in stock_codes if code not in code_to_industry])
 if missing_industry_count:
     print(f"本地行业映射缺失数量：{missing_industry_count}，缺失股票在报表中标记为未分类。")
-
-# =========================
-# 4. 行情获取
-# =========================
-def get_wsd_batch(codes, field, query_start_date, query_end_date, batch_size=500):
-    all_df = []
-    effective_batch_size = batch_size
-
-    for i in range(0, len(codes), effective_batch_size):
-        batch = codes[i:i + effective_batch_size]
-        print(f"拉取 {field}: {i}-{i + len(batch)} [{query_start_date} ~ {query_end_date}]")
-
-        data = w.wsd(batch, field, query_start_date, query_end_date, "PriceAdj=F")
-
-        if data.ErrorCode != 0 or len(data.Times) == 0:
-            print("失败批次：", batch[:3])
-            continue
-
-        if len(data.Data) == len(data.Codes):
-            df = pd.DataFrame(data.Data, index=data.Codes).T
-            df.index = data.Times
-        elif len(data.Data) == len(data.Times):
-            df = pd.DataFrame(data.Data, index=data.Times, columns=data.Codes)
-        elif len(data.Times) == 1 and len(data.Data) == 1:
-            df = pd.DataFrame([data.Data[0]], index=data.Times, columns=data.Codes)
-        else:
-            print(
-                f"返回维度异常：field={field}, codes={len(data.Codes)}, "
-                f"times={len(data.Times)}, data_rows={len(data.Data)}"
-            )
-            print("失败批次：", batch[:3])
-            continue
-
-        df = df.apply(pd.to_numeric, errors="coerce")
-        df.index = pd.to_datetime(df.index)
-        all_df.append(df)
-
-    if not all_df:
-        return pd.DataFrame()
-
-    df = pd.concat(all_df, axis=1)
-    df = df.sort_index()
-    df = df.loc[:, ~df.columns.duplicated()]
-
-    return df
-
 
 def get_wsq_rt_open_batch(codes, trade_date, batch_size=500):
     all_rows = []
@@ -640,7 +638,7 @@ def get_wsq_realtime_batch(codes, wsq_field, trade_date, batch_size=500):
 
 
 def get_cache_path(field):
-    return os.path.join(CACHE_DIR, f"{CACHE_PREFIX}_{field}_PriceAdjF.pkl")
+    return os.path.join(TEMP_CACHE_DIR, f"{CACHE_PREFIX}_{field}_PriceAdjF.pkl")
 
 
 def sanitize_price_df(df, allow_zero=False):
@@ -734,7 +732,8 @@ def get_price_df_with_cache(codes, field):
     allow_zero = field in {"volume", "amt"}
     df = sanitize_price_df(df, allow_zero=allow_zero)
     df = drop_all_nan_rows(df, allow_zero=allow_zero)
-    df = supplement_with_wsq(df, codes, field, end_date)
+    if realtime_quotes_enabled:
+        df = supplement_with_wsq(df, codes, field, end_date)
     df = drop_all_nan_rows(df, allow_zero=allow_zero)
     if df.empty:
         raise ValueError(f"{field} 从本地行情数据库读取为空，请先运行 update_local_market_db.py 更新日行情。")
@@ -851,6 +850,39 @@ high_df = get_price_df_with_cache(stock_codes, "high")
 close_df = get_price_df_with_cache(stock_codes, "close")
 volume_df = get_price_df_with_cache(stock_codes, "volume")
 amt_df = get_price_df_with_cache(stock_codes, "amt")
+
+# 所有价格矩阵必须使用同一交易日索引。实时接口可能暂时只返回最新价、
+# 尚未返回开高低；此时回退到六个字段共同具备数据的最近日期，避免把
+# 不完整的实时截面混入回测，也避免对缺失日期使用 .at 强索引而报错。
+price_frames = {
+    "open": open_df,
+    "low": low_df,
+    "high": high_df,
+    "close": close_df,
+    "volume": volume_df,
+    "amt": amt_df,
+}
+common_dates = close_df.index
+for frame in price_frames.values():
+    common_dates = common_dates.intersection(frame.index)
+if common_dates.empty:
+    raise RuntimeError("开高低收、成交量和成交额不存在共同交易日，无法运行策略。")
+
+latest_common_date = common_dates.max()
+if latest_common_date < close_df.index.max():
+    print(
+        f"最新实时截面字段不完整，策略从 {close_df.index.max().strftime('%Y-%m-%d')} "
+        f"回退到共同完整日期 {latest_common_date.strftime('%Y-%m-%d')}。"
+    )
+
+close_df = close_df.loc[:latest_common_date]
+aligned_index = close_df.index
+aligned_columns = close_df.columns
+open_df = open_df.reindex(index=aligned_index, columns=aligned_columns)
+low_df = low_df.reindex(index=aligned_index, columns=aligned_columns)
+high_df = high_df.reindex(index=aligned_index, columns=aligned_columns)
+volume_df = volume_df.reindex(index=aligned_index, columns=aligned_columns)
+amt_df = amt_df.reindex(index=aligned_index, columns=aligned_columns)
 
 print("行情维度：", close_df.shape)
 latest_data_ts = close_df.index[-1]

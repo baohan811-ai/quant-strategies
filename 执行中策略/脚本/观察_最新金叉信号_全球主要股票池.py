@@ -1,7 +1,6 @@
 from WindPy import w
 import os
 import subprocess
-import sqlite3
 import sys
 import pandas as pd
 import numpy as np
@@ -11,7 +10,12 @@ from zoneinfo import ZoneInfo
 
 from 维护工具.local_market_db import (
     MARKET_DB_PATH,
+    TEMP_CACHE_DIR,
+    CANONICAL_PRICE_READY,
     COMPLETE_EOD_PRICE_FIELDS,
+    count_complete_price_rows as count_shared_complete_price_rows,
+    ensure_market_data_updated,
+    get_canonical_price_model_status,
     load_price_matrix,
     load_stock_industry_map,
 )
@@ -20,11 +24,10 @@ from 维护工具.local_market_db import (
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(SCRIPT_DIR)
 REPO_DIR = os.path.dirname(BASE_DIR)
-CACHE_DIR = os.path.join(BASE_DIR, "缓存")
 OUTPUT_DIR = os.path.join(BASE_DIR, "输出", "最新金叉信号")
 PAGES_DIR = os.path.join(REPO_DIR, "docs")
 PAGES_INDEX_FILE = os.path.join(PAGES_DIR, "index.html")
-os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(TEMP_CACHE_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 LOOKBACK_DAYS = 260
@@ -238,7 +241,7 @@ def sanitize_price_df(df):
 
 
 def get_cache_path(cache_prefix, field):
-    return os.path.join(CACHE_DIR, f"{cache_prefix}_{field}_PriceAdjF.pkl")
+    return os.path.join(TEMP_CACHE_DIR, f"{cache_prefix}_{field}_PriceAdjF.pkl")
 
 
 def load_cached_df(cache_prefix, field):
@@ -309,11 +312,6 @@ def get_wsq_last_batch(codes, trade_date, batch_size=1000):
     return sanitize_price_df(df)
 
 
-def chunked(items, size):
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
-
-
 def get_required_db_fields(universe):
     if universe.get("require_complete_eod", True):
         return list(COMPLETE_EOD_PRICE_FIELDS)
@@ -321,29 +319,40 @@ def get_required_db_fields(universe):
 
 
 def count_complete_price_rows(db_path, codes, trade_date, adjusted, fields):
-    if not os.path.exists(db_path) or not codes:
-        return 0
+    return count_shared_complete_price_rows(
+        codes,
+        trade_date,
+        fields=fields,
+        db_path=db_path,
+        adjusted=adjusted,
+    )
 
-    field_conditions = " AND ".join(f"{field} IS NOT NULL" for field in fields)
-    total = 0
-    with sqlite3.connect(db_path) as conn:
-        for code_chunk in chunked(list(codes), 800):
-            placeholders = ",".join("?" for _ in code_chunk)
-            query = f"""
-                SELECT COUNT(DISTINCT wind_code)
-                FROM daily_prices
-                WHERE adjusted = ?
-                  AND trade_date = ?
-                  AND wind_code IN ({placeholders})
-                  AND {field_conditions}
-            """
-            row = conn.execute(query, [adjusted, trade_date, *code_chunk]).fetchone()
-            total += int(row[0] or 0)
-    return total
+
+def uses_canonical_a_share_prices(universe):
+    return (
+        universe.get("name") == "全部A股"
+        and universe.get("adjusted", "F") == "F"
+        and get_canonical_price_model_status(MARKET_DB_PATH) == CANONICAL_PRICE_READY
+    )
 
 
 def ensure_universe_local_db_updated(universe, codes, eod_end_date):
     if not universe.get("use_local_db"):
+        return
+
+    if uses_canonical_a_share_prices(universe):
+        ensure_market_data_updated(
+            w,
+            datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d"),
+            db_path=MARKET_DB_PATH,
+            universe_name=universe["name"],
+            sector_id=universe["sector_id"],
+            price_fields=get_required_db_fields(universe),
+            target_codes=codes,
+            price_option=universe["price_option"],
+            adjusted=universe.get("adjusted", "F"),
+            latest_complete_target_date=eod_end_date,
+        )
         return
 
     min_coverage = max(1, int(len(codes) * 0.95))
@@ -421,6 +430,7 @@ def ensure_universe_local_db_updated(universe, codes, eod_end_date):
 
 def get_price_df_with_cache(universe, codes, field, start_date, end_date, realtime_date=None):
     require_complete_eod = universe.get("require_complete_eod", True)
+    canonical_a_share = uses_canonical_a_share_prices(universe)
     if universe.get("use_local_db"):
         price_df = load_price_matrix(
             universe["cache_prefix"],
@@ -453,6 +463,13 @@ def get_price_df_with_cache(universe, codes, field, start_date, end_date, realti
             low_coverage_dates = recent_coverage[recent_coverage < min_recent_coverage]
             if not low_coverage_dates.empty:
                 coverage_start = low_coverage_dates.index[0]
+                if canonical_a_share:
+                    raise RuntimeError(
+                        f"{universe['name']} 权威行情库最近 {field} 覆盖不足："
+                        f"{coverage_start.date()} 起最低仅 "
+                        f"{int(low_coverage_dates.min())}/{len(codes)} 只。"
+                        "禁止用 Wind PriceAdj=F 临时混补，请先按额度修复权威库。"
+                    )
                 print(
                     f"{universe['name']} 最近 {field} 覆盖不足："
                     f"{coverage_start.date()} 起最低仅 "
@@ -481,6 +498,12 @@ def get_price_df_with_cache(universe, codes, field, start_date, end_date, realti
             latest_local_date = price_df.dropna(how="all").index.max()
             if pd.notna(latest_local_date) and latest_local_date < pd.Timestamp(end_date):
                 missing_start = latest_local_date + pd.Timedelta(days=1)
+                if canonical_a_share:
+                    raise RuntimeError(
+                        f"{universe['name']} 权威行情库 {field} 截止 "
+                        f"{latest_local_date.date()}，早于要求的 {end_date}。"
+                        "禁止回退 Wind PriceAdj=F，请先按额度更新权威库。"
+                    )
                 if field == PRICE_FIELD:
                     refresh_start = latest_local_date - pd.Timedelta(days=ADJUSTED_PRICE_REFRESH_DAYS - 1)
                     missing_start = max(refresh_start, pd.Timestamp(start_date))
@@ -522,6 +545,11 @@ def get_price_df_with_cache(universe, codes, field, start_date, end_date, realti
                     f"小于 EOD 截止 {end_date}；为避免报告日期和数据日期不一致，已停止。"
                 )
             return price_df
+        if canonical_a_share:
+            raise RuntimeError(
+                f"{universe['name']} 权威行情库 {field} 为空；"
+                "禁止回退旧 SQLite、pkl 或 Wind PriceAdj=F。"
+            )
         print(f"{universe['name']} 本地 SQLite {field} 为空，回退 Wind/pkl 缓存")
 
     cache_prefix = universe["cache_prefix"]

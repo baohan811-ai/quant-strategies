@@ -2,7 +2,7 @@
 """分析金叉触发日涨跌与次日开盘买入后收益的关系。
 
 数据和交易规则均来自“趋势发现_金叉_中证800_前高回撤低效退出_执行版”：
-- 本地未复权日线数据库；
+- 共用行情读取层提供的前复权日线；
 - 历史中证800月频成分快照；
 - 次交易日开盘买入、交易成本、仓位约束、回撤/低效退出规则。
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,11 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[3]
 DB_PATH = ROOT / "执行中策略/缓存/本地行情数据库.sqlite3"
 OUTPUT_DIR = ROOT / "执行中策略/输出/收益归因/金叉当日涨跌"
+SCRIPT_ROOT = ROOT / "执行中策略/脚本"
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from 维护工具.local_market_db import load_price_matrix
 
 TRADE_START = pd.Timestamp("2022-01-01")
 END_DATE = pd.Timestamp("2026-08-05")  # 本地完整日线截止日
@@ -74,19 +80,6 @@ def load_inputs():
         snapshots["snapshot_date"] = pd.to_datetime(snapshots["snapshot_date"])
         codes = snapshots["wind_code"].drop_duplicates().tolist()
         placeholders = ",".join("?" for _ in codes)
-        prices = pd.read_sql_query(
-            f"""
-            SELECT trade_date, wind_code, open, high, low, close, volume, amt
-            FROM daily_prices
-            WHERE adjusted='F' AND trade_date BETWEEN '2018-01-01' AND ?
-              AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL
-              AND close IS NOT NULL AND volume IS NOT NULL AND amt IS NOT NULL
-              AND wind_code IN ({placeholders})
-            ORDER BY trade_date, wind_code
-            """,
-            conn,
-            params=[END_DATE.strftime("%Y-%m-%d"), *codes],
-        )
         industries = pd.read_sql_query(
             f"""
             SELECT wind_code, sec_name, industry_level1
@@ -97,10 +90,21 @@ def load_inputs():
             params=codes,
         )
 
-    prices["trade_date"] = pd.to_datetime(prices["trade_date"])
     fields = {}
     for field in ["open", "high", "low", "close", "volume", "amt"]:
-        matrix = prices.pivot(index="trade_date", columns="wind_code", values=field).reindex(columns=codes)
+        matrix = load_price_matrix(
+            "收益归因_中证800",
+            field,
+            codes=codes,
+            start_date="2018-01-01",
+            end_date=END_DATE,
+            target_columns=codes,
+            prefer_sqlite=True,
+            fallback_pickle=False,
+            require_complete_eod=True,
+            adjusted="F",
+            db_path=DB_PATH,
+        )
         matrix = matrix.where(matrix >= 0 if field in {"volume", "amt"} else matrix > 0, np.nan)
         fields[field] = matrix.loc[matrix.notna().sum(axis=1).gt(0)]
     names = (

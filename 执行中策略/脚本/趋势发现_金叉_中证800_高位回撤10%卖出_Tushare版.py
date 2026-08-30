@@ -9,12 +9,16 @@ from datetime import datetime, timedelta
 from openpyxl.styles import Font
 from openpyxl.drawing.image import Image as OpenpyxlImage
 
-from 维护工具.local_market_db import MARKET_DB_PATH, init_market_db, load_price_matrix
+from 维护工具.local_market_db import (
+    MARKET_DB_PATH,
+    TEMP_CACHE_DIR,
+    init_market_db,
+    load_price_matrix,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(SCRIPT_DIR)
-CACHE_DIR = os.path.join(BASE_DIR, "缓存")
-os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(TEMP_CACHE_DIR, exist_ok=True)
 
 # =========================
 # 0. 参数
@@ -51,7 +55,9 @@ TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
 TUSHARE_INDEX_CODE = "000906.SH"
 TUSHARE_API_URL = "http://api.tushare.pro"
 TUSHARE_SLEEP_SECONDS = 0.25
-CONSTITUENT_CACHE_PATH = os.path.join(CACHE_DIR, "中证800_tushare_constituents.pkl")
+CONSTITUENT_CACHE_PATH = os.path.join(
+    TEMP_CACHE_DIR, "中证800_tushare_constituents.pkl"
+)
 TUSHARE_DAILY_RANGE_CACHE = {}
 TUSHARE_REALTIME_CACHE = {}
 TUSHARE_REALTIME_BATCH_SIZE = 400
@@ -681,7 +687,7 @@ if USE_HISTORICAL_CONSTITUENTS:
 
 
 def get_cache_path(field):
-    return os.path.join(CACHE_DIR, f"{CACHE_PREFIX}_{field}_PriceAdjF.pkl")
+    return os.path.join(TEMP_CACHE_DIR, f"{CACHE_PREFIX}_{field}_PriceAdjF.pkl")
 
 
 def sanitize_price_df(df):

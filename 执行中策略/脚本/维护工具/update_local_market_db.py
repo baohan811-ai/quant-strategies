@@ -3,6 +3,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -28,6 +29,7 @@ DEFAULT_ADJUST_CHECK_DAYS = 10
 DEFAULT_ADJUST_TOLERANCE = 0.0001
 DEFAULT_INCREMENTAL_REFRESH_DAYS = 15
 DEFAULT_INCREMENTAL_CONSISTENCY_TOLERANCE = 0.0001
+FORWARD_ADJUSTED_OHLC_FIELDS = ["open", "high", "low", "close"]
 DEFAULT_CORPORATE_ACTION_LOOKBACK_DAYS = 7
 DEFAULT_CORPORATE_ACTION_RPT_LOOKBACK_QUARTERS = 4
 DEFAULT_INDUSTRY_FIELD = "wicsname2024"
@@ -35,11 +37,19 @@ DEFAULT_INDUSTRY_OPTIONS = "tradeDate={trade_date};industryType=1;"
 CORPORATE_ACTION_FIELDS = [
     "div_exdate",
     "div_cashbeforetax",
+    "div_prelandate",
+    "div_impdate",
     "div_capitalization",
     "div_stock",
     "div_recorddate",
     "div_paydate",
     "div_progress",
+]
+PIT_DIVIDEND_FIELDS = [
+    "div_exdate",
+    "div_cashbeforetax",
+    "div_prelandate",
+    "div_impdate",
 ]
 
 
@@ -127,6 +137,8 @@ def ensure_corporate_action_table(conn):
             sec_name TEXT,
             rpt_date TEXT NOT NULL,
             ex_date TEXT NOT NULL,
+            proposal_announcement_date TEXT,
+            implementation_announcement_date TEXT,
             record_date TEXT,
             pay_date TEXT,
             cash_before_tax REAL,
@@ -141,6 +153,15 @@ def ensure_corporate_action_table(conn):
         CREATE INDEX IF NOT EXISTS idx_corporate_action_events_ex_date
         ON corporate_action_events (ex_date)
     """)
+    existing_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(corporate_action_events)").fetchall()
+    }
+    for column in ["proposal_announcement_date", "implementation_announcement_date"]:
+        if column not in existing_columns:
+            conn.execute(
+                f"ALTER TABLE corporate_action_events ADD COLUMN {column} TEXT"
+            )
     conn.commit()
 
 
@@ -392,11 +413,13 @@ def date_value_to_string(value):
     return pd.Timestamp(value).strftime("%Y-%m-%d")
 
 
-def fetch_corporate_action_events(w, universe_df, rpt_dates, batch_size):
+def fetch_corporate_action_events(
+    w, universe_df, rpt_dates, batch_size, requested_fields=None
+):
     rows = []
     codes = universe_df["wind_code"].tolist()
     code_to_name = dict(zip(universe_df["wind_code"], universe_df["sec_name"]))
-    fields = ",".join(CORPORATE_ACTION_FIELDS)
+    fields = ",".join(requested_fields or CORPORATE_ACTION_FIELDS)
     for rpt_date in rpt_dates:
         for batch_start in range(0, len(codes), batch_size):
             batch_end = min(batch_start + batch_size, len(codes))
@@ -424,6 +447,12 @@ def fetch_corporate_action_events(w, universe_df, rpt_dates, batch_size):
                     "sec_name": code_to_name.get(code),
                     "rpt_date": pd.Timestamp(rpt_date).strftime("%Y-%m-%d"),
                     "ex_date": ex_date,
+                    "proposal_announcement_date": date_value_to_string(
+                        field_data.get("div_prelandate", [None] * len(batch_codes))[idx]
+                    ),
+                    "implementation_announcement_date": date_value_to_string(
+                        field_data.get("div_impdate", [None] * len(batch_codes))[idx]
+                    ),
                     "record_date": date_value_to_string(field_data.get("div_recorddate", [None] * len(batch_codes))[idx]),
                     "pay_date": date_value_to_string(field_data.get("div_paydate", [None] * len(batch_codes))[idx]),
                     "cash_before_tax": field_data.get("div_cashbeforetax", [None] * len(batch_codes))[idx],
@@ -447,29 +476,41 @@ def save_corporate_action_events(conn, events_df):
             row.sec_name,
             row.rpt_date,
             row.ex_date,
+            row.proposal_announcement_date,
+            row.implementation_announcement_date,
             row.record_date,
             row.pay_date,
             None if pd.isna(row.cash_before_tax) else float(row.cash_before_tax),
             None if pd.isna(row.capitalization_ratio) else float(row.capitalization_ratio),
             None if pd.isna(row.stock_dividend_ratio) else float(row.stock_dividend_ratio),
             row.progress,
+            "Wind",
+            ",".join(CORPORATE_ACTION_FIELDS),
+            updated_at,
             updated_at,
         ))
     conn.executemany("""
         INSERT INTO corporate_action_events (
-            wind_code, sec_name, rpt_date, ex_date, record_date, pay_date,
+            wind_code, sec_name, rpt_date, ex_date,
+            proposal_announcement_date, implementation_announcement_date,
+            record_date, pay_date,
             cash_before_tax, capitalization_ratio, stock_dividend_ratio,
-            progress, updated_at
+            progress, source, source_fields, source_updated_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(wind_code, rpt_date, ex_date) DO UPDATE SET
             sec_name = excluded.sec_name,
             record_date = excluded.record_date,
             pay_date = excluded.pay_date,
+            proposal_announcement_date = excluded.proposal_announcement_date,
+            implementation_announcement_date = excluded.implementation_announcement_date,
             cash_before_tax = excluded.cash_before_tax,
             capitalization_ratio = excluded.capitalization_ratio,
             stock_dividend_ratio = excluded.stock_dividend_ratio,
             progress = excluded.progress,
+            source = excluded.source,
+            source_fields = excluded.source_fields,
+            source_updated_at = excluded.source_updated_at,
             updated_at = excluded.updated_at
     """, rows)
     conn.commit()
@@ -974,6 +1015,177 @@ def corporate_action_refresh(
         w.close()
 
 
+def report_dates_between(start_date, end_date):
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    dates = []
+    for year in range(start_ts.year, end_ts.year + 1):
+        for month, day in [(3, 31), (6, 30), (9, 30), (12, 31)]:
+            value = pd.Timestamp(year=year, month=month, day=day)
+            if start_ts <= value <= end_ts:
+                dates.append(value.strftime("%Y%m%d"))
+    return dates
+
+
+def corporate_action_backfill_only(
+    db_path, universe_name, sector_id, start_date, end_date, batch_size,
+):
+    """只补历史现金分红事件，不触发行情回刷。"""
+    from WindPy import w
+
+    w.start()
+    conn = sqlite3.connect(db_path)
+    try:
+        ensure_corporate_action_table(conn)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS corporate_action_fetch_batches (
+            rpt_date TEXT NOT NULL,
+            batch_start INTEGER NOT NULL,
+            batch_end INTEGER NOT NULL,
+            field_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error_code INTEGER,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (rpt_date, batch_start, batch_end, field_version))"""
+        )
+        try:
+            universe_df = get_historical_universe_constituents(
+                conn, universe_name, "2018-01-01", end_date
+            )
+        except RuntimeError:
+            universe_df = get_wind_sector_constituents(w, sector_id)
+        rpt_dates = report_dates_between(start_date, end_date)
+        print(
+            f"历史分红回补：{len(universe_df)} 只股票，"
+            f"{len(rpt_dates)} 个报告期，只取公告日/实施日/除息日/现金分红"
+        )
+        field_version = "pit_dividend_v1"
+        total_saved = 0
+        quota_blocked = False
+        for rpt_date in rpt_dates:
+            for batch_start in range(0, len(universe_df), batch_size):
+                batch_end = min(batch_start + batch_size, len(universe_df))
+                previous = conn.execute(
+                    """SELECT status FROM corporate_action_fetch_batches
+                    WHERE rpt_date=? AND batch_start=? AND batch_end=?
+                      AND field_version=?""",
+                    (rpt_date, batch_start, batch_end, field_version),
+                ).fetchone()
+                if previous and previous[0] == "success":
+                    continue
+                batch_universe = universe_df.iloc[batch_start:batch_end]
+                fields = ",".join(PIT_DIVIDEND_FIELDS)
+                print(
+                    f"拉取历史分红: rptDate={rpt_date} "
+                    f"股票 {batch_start}-{batch_end}"
+                )
+                for attempt in range(4):
+                    data = w.wss(
+                        batch_universe["wind_code"].tolist(), fields,
+                        f"rptDate={rpt_date}",
+                    )
+                    if data.ErrorCode not in {-40521007, -40522017}:
+                        break
+                    if attempt < 3:
+                        wait_seconds = 2 ** (attempt + 1)
+                        print(
+                            f"Wind 暂时限流，{wait_seconds} 秒后重试 "
+                            f"({attempt + 1}/3)"
+                        )
+                        time.sleep(wait_seconds)
+                now = datetime.now().isoformat(timespec="seconds")
+                if data.ErrorCode != 0:
+                    conn.execute(
+                        """INSERT INTO corporate_action_fetch_batches
+                        VALUES (?,?,?,?,?,?,?)
+                        ON CONFLICT(rpt_date,batch_start,batch_end,field_version)
+                        DO UPDATE SET status=excluded.status,
+                                      error_code=excluded.error_code,
+                                      updated_at=excluded.updated_at""",
+                        (rpt_date, batch_start, batch_end, field_version,
+                         "failed", data.ErrorCode, now),
+                    )
+                    conn.commit()
+                    print(f"历史分红失败：ErrorCode={data.ErrorCode}")
+                    if data.ErrorCode in {-40521007, -40522017}:
+                        quota_blocked = True
+                        break
+                    continue
+                field_data = {
+                    field.lower(): values
+                    for field, values in zip(data.Fields, data.Data)
+                }
+                rows = []
+                codes = batch_universe["wind_code"].tolist()
+                names = dict(zip(
+                    batch_universe["wind_code"], batch_universe["sec_name"]
+                ))
+                for index, code in enumerate(codes):
+                    ex_date = date_value_to_string(
+                        field_data.get("div_exdate", [None] * len(codes))[index]
+                    )
+                    if not ex_date:
+                        continue
+                    rows.append({
+                        "wind_code": code,
+                        "sec_name": names.get(code),
+                        "rpt_date": pd.Timestamp(rpt_date).strftime("%Y-%m-%d"),
+                        "ex_date": ex_date,
+                        "proposal_announcement_date": date_value_to_string(
+                            field_data.get("div_prelandate", [None] * len(codes))[index]
+                        ),
+                        "implementation_announcement_date": date_value_to_string(
+                            field_data.get("div_impdate", [None] * len(codes))[index]
+                        ),
+                        "record_date": None,
+                        "pay_date": None,
+                        "cash_before_tax": field_data.get(
+                            "div_cashbeforetax", [None] * len(codes)
+                        )[index],
+                        "capitalization_ratio": None,
+                        "stock_dividend_ratio": None,
+                        "progress": "实施（历史PIT回补）",
+                    })
+                total_saved += save_corporate_action_events(conn, pd.DataFrame(rows))
+                conn.execute(
+                    """INSERT INTO corporate_action_fetch_batches
+                    VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(rpt_date,batch_start,batch_end,field_version)
+                    DO UPDATE SET status=excluded.status,error_code=NULL,
+                                  updated_at=excluded.updated_at""",
+                    (rpt_date, batch_start, batch_end, field_version,
+                     "success", None, now),
+                )
+                conn.commit()
+                time.sleep(0.2)
+            if quota_blocked:
+                break
+        expected = len(rpt_dates) * len(range(0, len(universe_df), batch_size))
+        success = conn.execute(
+            "SELECT COUNT(*) FROM corporate_action_fetch_batches "
+            "WHERE field_version=? AND status='success'",
+            (field_version,),
+        ).fetchone()[0]
+        print(f"历史分红本次写入：{total_saved} 条；完成批次 {success}/{expected}")
+        if success >= expected:
+            for key, value in [
+                ("pit_dividend_complete_start_date", start_date),
+                ("pit_dividend_complete_end_date", end_date),
+            ]:
+                conn.execute(
+                    """INSERT INTO metadata(key,value,updated_at) VALUES(?,?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                    updated_at=excluded.updated_at""",
+                    (key, value, datetime.now().isoformat(timespec="seconds")),
+                )
+            conn.commit()
+        elif quota_blocked:
+            print("Wind 额度不足，已在断点停止；额度恢复后原命令可续跑。")
+    finally:
+        conn.close()
+        w.close()
+
+
 def fetch_price_batch_from_wind(
     w,
     conn,
@@ -1093,11 +1305,17 @@ def update_prices_from_wind(
                     f"自动修复前复权漂移股票：{len(drift_codes)} 只，"
                     f"回刷 {adjust_history_start_date} ~ {end_date}"
                 )
+                repair_fields = [
+                    field for field in fields if field in FORWARD_ADJUSTED_OHLC_FIELDS
+                ]
+                if not repair_fields:
+                    repair_fields = ["close"]
+                print(f"历史复权回刷字段：{', '.join(repair_fields)}")
                 refresh_codes_from_wind(
                     w,
                     conn,
                     drift_codes,
-                    fields,
+                    repair_fields,
                     adjust_history_start_date,
                     end_date,
                     batch_size,
@@ -1168,6 +1386,8 @@ def smart_adjustment_refresh(
     tolerance,
     deep_adjust_check=False,
     adjust_check_frequency="Q",
+    check_only=False,
+    repair_db_path=None,
 ):
     from WindPy import w
 
@@ -1209,16 +1429,28 @@ def smart_adjustment_refresh(
 
         print(f"发现疑似复权口径变化股票 {len(drift_codes)} 只：")
         print(", ".join(drift_codes[:50]) + (" ..." if len(drift_codes) > 50 else ""))
-        refresh_codes_from_wind(
-            w,
-            conn,
-            drift_codes,
-            fields,
-            start_date,
-            end_date,
-            batch_size,
-            date_chunk,
-        )
+        if check_only:
+            print("仅审计模式：不回刷、不修改本地行情库")
+            return
+        repair_conn = conn
+        if repair_db_path:
+            init_market_db(repair_db_path)
+            repair_conn = sqlite3.connect(repair_db_path)
+            print(f"复权修正写入隔离库：{repair_db_path}")
+        try:
+            refresh_codes_from_wind(
+                w,
+                repair_conn,
+                drift_codes,
+                fields,
+                start_date,
+                end_date,
+                batch_size,
+                date_chunk,
+            )
+        finally:
+            if repair_conn is not conn:
+                repair_conn.close()
     finally:
         conn.close()
         w.close()
@@ -1235,6 +1467,7 @@ def main():
     parser.add_argument("--repair-adjust-drift", action="store_true", help="增量更新发现前复权漂移时，先回刷漂移股票历史再继续更新")
     parser.add_argument("--use-historical-universe-snapshots", action="store_true", help="使用本地历史成分快照并集作为行情股票池")
     parser.add_argument("--corporate-action-refresh", action="store_true", help="抓取近期除权除息事件，并回刷事件股票历史前复权行情")
+    parser.add_argument("--corporate-action-backfill-only", action="store_true", help="只回补历史分红公告与除息事件，不回刷行情")
     parser.add_argument("--industries-from-wind", action="store_true", help="从 Wind 拉取股票所属一级行业写入 SQLite，默认每季度更新一次")
     parser.add_argument("--smart-adjust-refresh", action="store_true", help="校验最近 close 偏差，仅回刷疑似除权复权变化个股")
     parser.add_argument("--universe-name", default="全部A股")
@@ -1255,9 +1488,12 @@ def main():
     parser.add_argument("--check-days", type=int, default=DEFAULT_ADJUST_CHECK_DAYS)
     parser.add_argument("--adjust-tolerance", type=float, default=DEFAULT_ADJUST_TOLERANCE)
     parser.add_argument("--deep-adjust-check", action="store_true", help="用历史锚点日期检查前复权口径漂移，而不只检查最近几天")
+    parser.add_argument("--check-adjust-only", action="store_true", help="仅检查前复权漂移，发现异常也不自动回刷")
+    parser.add_argument("--adjust-overlay-db", help="将复权修正写入隔离SQLite，不覆盖主行情库")
     parser.add_argument("--adjust-check-frequency", choices=["M", "Q"], default="Q", help="深度前复权检查锚点频率")
     parser.add_argument("--event-lookback-days", type=int, default=DEFAULT_CORPORATE_ACTION_LOOKBACK_DAYS)
     parser.add_argument("--event-rpt-lookback-quarters", type=int, default=DEFAULT_CORPORATE_ACTION_RPT_LOOKBACK_QUARTERS)
+    parser.add_argument("--event-rpt-start-date", default="2016-12-31")
     args = parser.parse_args()
     effective_start_date = args.start_date
     if args.refresh_days is not None:
@@ -1322,6 +1558,16 @@ def main():
             rpt_lookback_quarters=args.event_rpt_lookback_quarters,
         )
 
+    if args.corporate_action_backfill_only:
+        corporate_action_backfill_only(
+            db_path=args.db_path,
+            universe_name=args.universe_name,
+            sector_id=args.sector_id,
+            start_date=args.event_rpt_start_date,
+            end_date=args.end_date,
+            batch_size=args.batch_size,
+        )
+
     if args.smart_adjust_refresh:
         smart_adjustment_refresh(
             db_path=args.db_path,
@@ -1336,6 +1582,8 @@ def main():
             tolerance=args.adjust_tolerance,
             deep_adjust_check=args.deep_adjust_check,
             adjust_check_frequency=args.adjust_check_frequency,
+            check_only=args.check_adjust_only,
+            repair_db_path=args.adjust_overlay_db,
         )
 
 

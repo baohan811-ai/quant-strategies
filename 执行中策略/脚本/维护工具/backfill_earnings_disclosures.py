@@ -40,6 +40,9 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             profit_yoy_mid REAL,
             disclosure_style TEXT,
             source_file TEXT,
+            report_period_verified INTEGER NOT NULL DEFAULT 0,
+            announcement_date_verified INTEGER NOT NULL DEFAULT 0,
+            revision_version_verified INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (wind_code, rpt_date, ann_date, disclosure_type)
         )
@@ -51,6 +54,20 @@ def ensure_table(conn: sqlite3.Connection) -> None:
         ON earnings_disclosures (ann_date, wind_code, rpt_date)
         """
     )
+    existing = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(earnings_disclosures)").fetchall()
+    }
+    for column in [
+        "report_period_verified",
+        "announcement_date_verified",
+        "revision_version_verified",
+    ]:
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE earnings_disclosures ADD COLUMN {column} "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 def historical_codes() -> list[str]:

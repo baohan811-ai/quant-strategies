@@ -30,6 +30,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from 维护工具.local_market_db import load_price_matrix, load_price_trading_dates
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASE_DIR = SCRIPT_DIR.parent
@@ -56,6 +58,7 @@ class StrategyConfig:
     min_data_coverage: float = 0.50
     min_market_cap: float = 0.0
     exclude_st: bool = True
+    min_listing_history_days: int = 180
 
     fundamental_weight: float = 0.25
     valuation_weight: float = 0.20
@@ -88,9 +91,11 @@ class StrategyConfig:
     industry_momentum_weight: float = 0.10
     industry_history_months: int = 36
     industry_history_min_observations: int = 12
-    earnings_guidance_enabled: bool = True
+    earnings_guidance_enabled: bool = False
     earnings_notice_confidence: float = 0.40
     earnings_express_confidence: float = 0.70
+    quality_data_mode: str = "calculated_ttm"
+    valuation_data_mode: str = "calculated_pit"
 
 
 SCORE_WEIGHTS = {
@@ -109,6 +114,8 @@ def validate_config(config: StrategyConfig) -> None:
         raise ValueError(f"六维评分权重合计必须为 1，当前为 {total:.6f}")
     if config.max_constituents <= 0:
         raise ValueError("max_constituents 必须大于 0")
+    if config.min_listing_history_days < 0:
+        raise ValueError("min_listing_history_days 不能为负数")
     if config.rebalance_frequency != "M":
         raise ValueError("当前确认的调仓频率为月度（M）")
     if config.industry_classification != INDUSTRY_SYSTEM:
@@ -123,6 +130,12 @@ def validate_config(config: StrategyConfig) -> None:
         raise ValueError("stock_factor_scope 必须为 industry_only 或 blended")
     if config.constituent_selection_mode not in {"industry_quota", "global_top"}:
         raise ValueError("constituent_selection_mode 必须为 industry_quota 或 global_top")
+    if config.quality_data_mode not in {"legacy", "safe_reported", "calculated_ttm"}:
+        raise ValueError(
+            "quality_data_mode 必须为 legacy、safe_reported 或 calculated_ttm"
+        )
+    if config.valuation_data_mode not in {"legacy", "calculated_pit"}:
+        raise ValueError("valuation_data_mode 必须为 legacy 或 calculated_pit")
     if not 0 <= config.industry_quota_min_score <= 100:
         raise ValueError("行业名额最低总分必须在 [0, 100] 内")
     if config.industry_target_mode not in {"selected_high_score_mass", "industry_score"}:
@@ -311,26 +324,155 @@ def load_industries(codes: list[str], as_of: str) -> pd.DataFrame:
     return industry
 
 
-def load_latest_fundamentals(codes: list[str], as_of: str) -> pd.DataFrame:
-    columns = [
-        "trade_date", "wind_code", "pe_ttm", "pb_lf", "ps_ttm",
-        "dividend_yield", "roe_ttm", "debt_to_assets",
+def load_listing_history(codes: list[str], as_of: str) -> pd.DataFrame:
+    """用历史全A截面首次出现日衡量上市历史，不伪造上市前预热数据。"""
+    with sqlite3.connect(MARKET_DB_PATH) as conn:
+        frame = pd.read_sql_query(
+            """SELECT wind_code, MIN(snapshot_date) AS first_universe_date
+            FROM universe_constituents_snapshot
+            WHERE universe_name = ? AND snapshot_date <= ?
+            GROUP BY wind_code""",
+            conn,
+            params=[ALL_A_UNIVERSE_NAME, as_of],
+        )
+    frame = frame[frame["wind_code"].isin(codes)].copy()
+    first_date = pd.to_datetime(frame["first_universe_date"], errors="coerce")
+    frame["listing_history_days"] = (pd.Timestamp(as_of) - first_date).dt.days
+    frame["上市历史状态"] = np.select(
+        [
+            frame["listing_history_days"] >= 365 * 3,
+            frame["listing_history_days"] >= 365,
+        ],
+        ["上市满三年", "上市一至三年"],
+        default="上市未满一年",
+    )
+    return frame
+
+
+def quality_select_columns(mode: str) -> list[str]:
+    if mode == "calculated_ttm":
+        return [
+            "roe_ttm_calculated AS roe_ttm",
+            "debt_to_assets_reported AS debt_to_assets",
+        ]
+    if mode == "safe_reported":
+        return [
+            "roe_reported AS roe_ttm",
+            "debt_to_assets_reported AS debt_to_assets",
+        ]
+    return ["roe_ttm", "debt_to_assets"]
+
+
+def valuation_select_columns(mode: str) -> list[str]:
+    if mode == "calculated_pit":
+        return [
+            "pe_ttm_calculated AS pe_ttm",
+            "pb_lf_calculated AS pb_lf",
+            "ps_ttm_calculated AS ps_ttm",
+            "dividend_yield_calculated AS dividend_yield",
+            "valuation_report_period",
+            "valuation_available_date",
+            "valuation_calculation_version",
+            "dividend_event_count",
+        ]
+    return [
+        "pe_ttm", "pb_lf", "ps_ttm", "dividend_yield",
+        "NULL AS valuation_report_period",
+        "NULL AS valuation_available_date",
+        "'legacy_wind' AS valuation_calculation_version",
+        "NULL AS dividend_event_count",
+    ]
+
+
+def load_latest_fundamentals(
+    codes: list[str], as_of: str, config: StrategyConfig
+) -> pd.DataFrame:
+    fundamental_columns = [
+        "trade_date", "wind_code", *quality_select_columns(config.quality_data_mode),
         "revenue_yoy_qfa", "netprofit_yoy_qfa",
         "gross_profit_margin_qfa", "net_profit_margin_qfa",
         "qfa_report_period", "qfa_available_date",
     ]
+
+    def select_expression(column: str) -> str:
+        if " AS " in column or column.startswith("NULL AS "):
+            return column
+        return f"f.{column}"
+
     with sqlite3.connect(FUNDAMENTAL_DB_PATH) as conn:
         data = pd.read_sql_query(
-            f"SELECT {','.join(columns)} FROM fundamentals WHERE trade_date <= ? ORDER BY wind_code, trade_date",
+            f"""SELECT {','.join(select_expression(column) for column in fundamental_columns)}
+            FROM fundamentals AS f
+            JOIN (
+                SELECT wind_code, MAX(trade_date) AS trade_date
+                FROM fundamentals WHERE trade_date <= ? GROUP BY wind_code
+            ) AS latest
+              ON latest.wind_code=f.wind_code AND latest.trade_date=f.trade_date
+            ORDER BY f.wind_code""",
+            conn,
+            params=[as_of],
+        )
+        if config.valuation_data_mode == "calculated_pit":
+            valuation_condition = "valuation_calculation_version IS NOT NULL"
+        else:
+            valuation_condition = (
+                "pe_ttm IS NOT NULL OR pb_lf IS NOT NULL OR "
+                "ps_ttm IS NOT NULL OR dividend_yield IS NOT NULL"
+            )
+        valuation_columns = valuation_select_columns(config.valuation_data_mode)
+        valuation = pd.read_sql_query(
+            f"""SELECT f.wind_code,
+                       f.trade_date AS valuation_factor_source_date,
+                       {','.join(select_expression(column) for column in valuation_columns)}
+            FROM fundamentals AS f
+            JOIN (
+                SELECT wind_code, MAX(trade_date) AS trade_date
+                FROM fundamentals
+                WHERE trade_date <= ? AND ({valuation_condition})
+                GROUP BY wind_code
+            ) AS latest
+              ON latest.wind_code=f.wind_code AND latest.trade_date=f.trade_date
+            ORDER BY f.wind_code""",
             conn,
             params=[as_of],
         )
     data = data[data["wind_code"].isin(codes)]
     if data.empty:
         raise RuntimeError(f"截止 {as_of} 没有可用基础面截面")
-    latest = data.groupby("wind_code", as_index=False).last()
-    latest = latest.rename(columns={"trade_date": "fundamental_source_date"})
-    return latest
+    valuation = valuation[valuation["wind_code"].isin(codes)]
+    data = data.rename(columns={"trade_date": "fundamental_source_date"})
+    return data.merge(valuation, on="wind_code", how="left")
+
+
+def validate_valuation_factor_coverage(
+    frame: pd.DataFrame,
+    as_of: str,
+    config: StrategyConfig,
+) -> dict[str, float]:
+    """估值高权重策略不得在估值字段大面积缺失时静默运行。"""
+    columns = ["pe_ttm", "pb_lf", "ps_ttm", "dividend_yield"]
+    coverage = {column: float(frame[column].notna().mean()) for column in columns}
+    insufficient = {
+        column: ratio
+        for column, ratio in coverage.items()
+        if ratio < config.valuation_min_coverage
+    }
+    if insufficient:
+        detail = "、".join(f"{column}={ratio:.1%}" for column, ratio in insufficient.items())
+        raise RuntimeError(
+            "估值因子覆盖率不足，已停止生成正式评分："
+            f"{detail}；最低要求={config.valuation_min_coverage:.1%}"
+        )
+
+    source_dates = pd.to_datetime(frame["valuation_factor_source_date"], errors="coerce")
+    stale_days = (pd.Timestamp(as_of) - source_dates).dt.days
+    stale_count = int((stale_days > config.stale_valuation_warning_days).sum())
+    if stale_count:
+        raise RuntimeError(
+            f"估值因子截面超过 {config.stale_valuation_warning_days} 天的股票有 "
+            f"{stale_count} 只，已停止生成正式评分"
+        )
+    return coverage
 
 
 def choose_valuation_date(as_of: str, universe_size: int, config: StrategyConfig) -> str:
@@ -375,6 +517,32 @@ def load_valuation(codes: list[str], as_of: str, config: StrategyConfig) -> tupl
     return valuation, valuation_date
 
 
+def load_adjusted_close_rows(
+    codes: list[str], start_date: str, end_date: str
+) -> pd.DataFrame:
+    """通过共享读取层取得前复权收盘价；新库激活后自动切换口径。"""
+    if not codes:
+        return pd.DataFrame(columns=["trade_date", "wind_code", "close"])
+    matrix = load_price_matrix(
+        "质量成长800",
+        "close",
+        codes=codes,
+        start_date=start_date,
+        end_date=end_date,
+        target_columns=codes,
+        prefer_sqlite=True,
+        fallback_pickle=False,
+        require_complete_eod=True,
+        adjusted="F",
+        db_path=MARKET_DB_PATH,
+    )
+    if matrix.empty or matrix.notna().sum().sum() == 0:
+        return pd.DataFrame(columns=["trade_date", "wind_code", "close"])
+    rows = matrix.rename_axis("trade_date").stack().rename("close").reset_index()
+    rows.columns = ["trade_date", "wind_code", "close"]
+    return rows
+
+
 def load_momentum_features(codes: list[str], as_of: str) -> pd.DataFrame:
     """计算12-1个月与6-1个月价格动量，跳过最近一个月。"""
     as_of_date = pd.Timestamp(as_of)
@@ -383,31 +551,23 @@ def load_momentum_features(codes: list[str], as_of: str) -> pd.DataFrame:
         "close_6m": as_of_date - pd.DateOffset(months=6),
         "close_12m": as_of_date - pd.DateOffset(months=12),
     }
-    code_set = set(codes)
     result = pd.DataFrame({"wind_code": codes})
-    with sqlite3.connect(MARKET_DB_PATH) as conn:
-        for column, target in targets.items():
-            start = target - pd.Timedelta(days=20)
-            prices = pd.read_sql_query(
-                """
-                SELECT trade_date, wind_code, close
-                FROM daily_prices
-                WHERE adjusted = 'F' AND trade_date >= ? AND trade_date <= ?
-                ORDER BY wind_code, trade_date
-                """,
-                conn,
-                params=[start.strftime("%Y-%m-%d"), target.strftime("%Y-%m-%d")],
-            )
-            prices = prices[prices["wind_code"].isin(code_set)]
-            latest = prices.groupby("wind_code", as_index=False).last()
-            latest = latest.rename(
-                columns={"close": column, "trade_date": f"{column}_date"}
-            )
-            result = result.merge(
-                latest[["wind_code", column, f"{column}_date"]],
-                on="wind_code",
-                how="left",
-            )
+    for column, target in targets.items():
+        start = target - pd.Timedelta(days=20)
+        prices = load_adjusted_close_rows(
+            codes,
+            start.strftime("%Y-%m-%d"),
+            target.strftime("%Y-%m-%d"),
+        ).sort_values(["wind_code", "trade_date"])
+        latest = prices.groupby("wind_code", as_index=False).last()
+        latest = latest.rename(
+            columns={"close": column, "trade_date": f"{column}_date"}
+        )
+        result = result.merge(
+            latest[["wind_code", column, f"{column}_date"]],
+            on="wind_code",
+            how="left",
+        )
     result["momentum_12_1"] = (
         finite_numeric(result["close_1m"]) / finite_numeric(result["close_12m"]) - 1
     )
@@ -492,6 +652,9 @@ def ensure_earnings_disclosure_table(conn: sqlite3.Connection) -> None:
             profit_yoy_mid REAL,
             disclosure_style TEXT,
             source_file TEXT,
+            report_period_verified INTEGER NOT NULL DEFAULT 0,
+            announcement_date_verified INTEGER NOT NULL DEFAULT 0,
+            revision_version_verified INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (wind_code, rpt_date, ann_date, disclosure_type)
         )
@@ -503,6 +666,21 @@ def ensure_earnings_disclosure_table(conn: sqlite3.Connection) -> None:
         ON earnings_disclosures (ann_date, wind_code, rpt_date)
         """
     )
+    existing = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(earnings_disclosures)").fetchall()
+    }
+    for column in [
+        "report_period_verified",
+        "announcement_date_verified",
+        "revision_version_verified",
+    ]:
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE earnings_disclosures ADD COLUMN {column} "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+    conn.commit()
 
 
 def import_earnings_disclosure_files() -> None:
@@ -620,6 +798,9 @@ def load_earnings_guidance(
                    disclosure_style, source_file
             FROM earnings_disclosures
             WHERE ann_date <= ?
+              AND report_period_verified = 1
+              AND announcement_date_verified = 1
+              AND revision_version_verified = 1
             """,
             conn,
             params=[as_of],
@@ -713,7 +894,15 @@ def build_industry_history_scores(
     with sqlite3.connect(FUNDAMENTAL_DB_PATH) as conn:
         history = pd.read_sql_query(
             f"""
-            SELECT trade_date, wind_code, {','.join(metric_columns)}
+            SELECT trade_date, wind_code,
+                   {','.join(
+                       [column for column in metric_columns if column not in {
+                           'pe_ttm', 'pb_lf', 'ps_ttm', 'dividend_yield',
+                           'roe_ttm', 'debt_to_assets'
+                       }]
+                       + valuation_select_columns(config.valuation_data_mode)[:4]
+                       + quality_select_columns(config.quality_data_mode)
+                   )}
             FROM fundamentals
             WHERE trade_date >= ? AND trade_date <= ?
             ORDER BY trade_date, wind_code
@@ -1634,7 +1823,8 @@ def build_index(
     universe = load_universe(as_of)
     codes = universe["wind_code"].tolist()
     industries = load_industries(codes, as_of)
-    fundamentals = load_latest_fundamentals(codes, as_of)
+    listing_history = load_listing_history(codes, as_of)
+    fundamentals = load_latest_fundamentals(codes, as_of, config)
     valuation, valuation_date = load_valuation(codes, as_of, config)
     if config.scoring_mode == "hybrid":
         momentum = load_momentum_features(codes, as_of)
@@ -1650,6 +1840,7 @@ def build_index(
     frame = (
         universe
         .merge(industries[["wind_code", "industry", "industry_source"]], on="wind_code", how="left")
+        .merge(listing_history, on="wind_code", how="left")
         .merge(fundamentals, on="wind_code", how="left")
         .merge(valuation, on="wind_code", how="left")
         .merge(momentum, on="wind_code", how="left")
@@ -1657,6 +1848,9 @@ def build_index(
     )
     frame["行业"] = frame["industry"].fillna("未分类")
     frame["证券名称"] = frame["sec_name"]
+    valuation_factor_coverage = validate_valuation_factor_coverage(
+        frame, as_of, config
+    )
     guidance = load_earnings_guidance(frame, as_of, config)
     frame = frame.merge(guidance, on="wind_code", how="left")
     frame["earnings_guidance_profit_acceleration"] = (
@@ -1672,9 +1866,22 @@ def build_index(
         config,
     )
     frame = build_scores(frame, config, industry_history_scores)
+    frame["历史数据状态"] = np.select(
+        [
+            finite_numeric(frame["report_count"]) >= 12,
+            finite_numeric(frame["report_count"]) >= 5,
+            finite_numeric(frame["report_count"]) >= 3,
+        ],
+        ["三年历史完整", "可算同比加速", "可算波动率"],
+        default="上市历史不足",
+    )
 
     eligible = frame[frame["数据完整度"] >= config.min_data_coverage].copy()
     eligible = eligible[finite_numeric(eligible["weighting_market_cap"]) > config.min_market_cap]
+    eligible = eligible[
+        finite_numeric(eligible["listing_history_days"])
+        >= config.min_listing_history_days
+    ]
     if config.exclude_st:
         eligible = eligible[
             ~eligible["证券名称"].fillna("").str.upper().str.contains(r"(?:^|\*)ST|PT", regex=True)
@@ -1755,12 +1962,22 @@ def build_index(
         "最终成分数量": len(selected),
         "行业数量": selected["行业"].nunique(),
         "市值截面日期": valuation_date,
+        "估值因子最早截面日期": str(frame["valuation_factor_source_date"].dropna().min()),
+        "估值因子最晚截面日期": str(frame["valuation_factor_source_date"].dropna().max()),
+        "PE覆盖率": valuation_factor_coverage["pe_ttm"],
+        "PB覆盖率": valuation_factor_coverage["pb_lf"],
+        "PS覆盖率": valuation_factor_coverage["ps_ttm"],
+        "股息率覆盖率": valuation_factor_coverage["dividend_yield"],
         "股票池来源": str(universe["universe_source"].iloc[0]),
         "行业权重来源": benchmark_source,
         "市值截面滞后天数": int((pd.Timestamp(as_of) - pd.Timestamp(valuation_date)).days),
         "平均数据完整度": float(selected["数据完整度"].mean()),
         "平均动量数据完整度": float(selected["momentum_data_coverage"].mean()),
         "完整动量历史成分数量": int((selected["momentum_data_coverage"] >= 1.0).sum()),
+        "三年财报历史完整成分数量": int((selected["历史数据状态"] == "三年历史完整").sum()),
+        "上市历史不足成分数量": int((selected["历史数据状态"] == "上市历史不足").sum()),
+        "上市未满三年成分数量": int((selected["listing_history_days"] < 365 * 3).sum()),
+        "最短上市历史要求天数": config.min_listing_history_days,
         "权重合计": float(selected["指数权重"].sum()),
         "最大个股权重": float(selected["指数权重"].max()),
         "个股评分倾斜强度": config.stock_score_tilt,
@@ -1819,12 +2036,16 @@ def export_result(
         "dividend_yield", "roe_ttm", "debt_to_assets", "revenue_yoy_qfa",
         "netprofit_yoy_qfa", "gross_profit_margin_qfa", "net_profit_margin_qfa",
         "momentum_12_1", "momentum_6_1", "momentum_data_coverage",
-        "report_count", "qfa_report_period", "qfa_available_date",
+        "first_universe_date", "listing_history_days", "上市历史状态",
+        "report_count", "历史数据状态", "qfa_report_period", "qfa_available_date",
+        "valuation_report_period", "valuation_available_date",
+        "valuation_calculation_version", "dividend_event_count",
         "earnings_guidance_report_period", "earnings_guidance_announcement_date",
         "earnings_guidance_type", "earnings_guidance_style",
         "earnings_guidance_profit_yoy", "earnings_guidance_profit_acceleration",
         "earnings_guidance_confidence", "earnings_guidance_source",
-        "fundamental_source_date", "valuation_source_date", "industry_source",
+        "fundamental_source_date", "valuation_factor_source_date",
+        "valuation_source_date", "industry_source",
     ]
     selected_columns = [column for column in selected_columns if column in selected.columns]
     ranking_columns = [
@@ -1844,7 +2065,9 @@ def export_result(
     )
     diagnostics_frame = pd.DataFrame(diagnostics.items(), columns=["检查项", "结果"])
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        selected[selected_columns].to_excel(writer, sheet_name="800成分与权重", index=False)
+        selected[selected_columns].to_excel(
+            writer, sheet_name=f"{config.max_constituents}成分与权重", index=False
+        )
         industry_summary.to_excel(writer, sheet_name="行业权重", index=False)
         all_scores.sort_values("总分", ascending=False)[ranking_columns].to_excel(
             writer, sheet_name="全市场评分", index=False
@@ -1860,8 +2083,9 @@ def load_signal_dates(start_date: str, end_date: str) -> list[str]:
     with sqlite3.connect(FUNDAMENTAL_DB_PATH) as conn:
         rows = conn.execute(
             """
-            SELECT DISTINCT trade_date FROM fundamentals
+            SELECT MAX(trade_date) AS trade_date FROM fundamentals
             WHERE trade_date >= ? AND trade_date <= ?
+            GROUP BY SUBSTR(trade_date, 1, 7)
             ORDER BY trade_date
             """,
             [start_date, end_date],
@@ -1870,16 +2094,12 @@ def load_signal_dates(start_date: str, end_date: str) -> list[str]:
 
 
 def load_trading_dates(start_date: str, end_date: str) -> pd.DatetimeIndex:
-    with sqlite3.connect(MARKET_DB_PATH) as conn:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT trade_date FROM daily_prices
-            WHERE adjusted = 'F' AND trade_date >= ? AND trade_date <= ?
-            ORDER BY trade_date
-            """,
-            [start_date, end_date],
-        ).fetchall()
-    return pd.DatetimeIndex(pd.to_datetime([row[0] for row in rows]))
+    return load_price_trading_dates(
+        start_date=start_date,
+        end_date=end_date,
+        adjusted="F",
+        db_path=MARKET_DB_PATH,
+    )
 
 
 def next_trading_date(trading_dates: pd.DatetimeIndex, signal_date: str):
@@ -1897,22 +2117,7 @@ def load_period_prices(
         return pd.DataFrame(index=trading_dates)
     start_text = pd.Timestamp(start_date).strftime("%Y-%m-%d")
     end_text = pd.Timestamp(end_date).strftime("%Y-%m-%d")
-    frames = []
-    with sqlite3.connect(MARKET_DB_PATH) as conn:
-        for start in range(0, len(codes), 800):
-            batch = codes[start:start + 800]
-            marks = ",".join("?" for _ in batch)
-            frames.append(pd.read_sql_query(
-                f"""
-                SELECT trade_date, wind_code, close
-                FROM daily_prices
-                WHERE adjusted = 'F' AND trade_date >= ? AND trade_date <= ?
-                  AND wind_code IN ({marks})
-                """,
-                conn,
-                params=[start_text, end_text, *batch],
-            ))
-    raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    raw = load_adjusted_close_rows(codes, start_text, end_text)
     if raw.empty:
         return pd.DataFrame(index=trading_dates, columns=codes, dtype=float)
     raw["trade_date"] = pd.to_datetime(raw["trade_date"])
@@ -2124,6 +2329,15 @@ def run_backtest(
         "日收益相关系数": float(daily["策略费后收益"].corr(daily["沪深300全收益"])),
     }
     metrics["模型配置"] = {
+        "质量数据口径": config.quality_data_mode,
+        "估值数据口径": config.valuation_data_mode,
+        "ROE口径": (
+            "按实际公告日可得的归母净利润/归母净资产自算TTM"
+            if config.quality_data_mode == "calculated_ttm"
+            else config.quality_data_mode
+        ),
+        "前复权数据源": str(MARKET_DB_PATH),
+        "隔离修正已事务合并主库": True,
         "个股评分模式": config.scoring_mode,
         "个股因子比较范围": config.stock_factor_scope,
         "成分选择模式": config.constituent_selection_mode,
@@ -2371,7 +2585,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable-earnings-guidance",
         action="store_true",
-        help="禁用业绩预告/快报对成长和周期得分的修正",
+        help="兼容旧参数：禁用业绩预告/快报",
+    )
+    parser.add_argument(
+        "--enable-earnings-guidance",
+        action="store_true",
+        help="仅在报告期、公告日和修订版本均已核验时显式启用预告/快报",
     )
     parser.add_argument(
         "--earnings-notice-confidence",
@@ -2384,6 +2603,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.70,
         help="业绩快报置信权重，默认0.70",
+    )
+    parser.add_argument(
+        "--quality-data-mode",
+        choices=["calculated_ttm", "safe_reported", "legacy"],
+        default="calculated_ttm",
+        help="ROE/负债率口径；calculated_ttm 为公告日可得的自算TTM ROE，legacy仅作旧结果对照",
+    )
+    parser.add_argument(
+        "--valuation-data-mode",
+        choices=["calculated_pit", "legacy"],
+        default="calculated_pit",
+        help="估值口径；calculated_pit 为公告日约束的自算 PE/PB/PS/股息率",
     )
     parser.add_argument("--benchmark-weights", type=Path)
     parser.add_argument("--previous-components", type=Path)
@@ -2447,9 +2678,13 @@ def main() -> None:
         stock_factor_scope=args.stock_factor_scope,
         constituent_selection_mode=args.constituent_selection_mode,
         industry_quota_min_score=args.industry_quota_min_score,
-        earnings_guidance_enabled=not args.disable_earnings_guidance,
+        earnings_guidance_enabled=(
+            args.enable_earnings_guidance and not args.disable_earnings_guidance
+        ),
         earnings_notice_confidence=args.earnings_notice_confidence,
         earnings_express_confidence=args.earnings_express_confidence,
+        quality_data_mode=args.quality_data_mode,
+        valuation_data_mode=args.valuation_data_mode,
     )
     validate_config(config)
     as_of = normalize_date(args.as_of)
